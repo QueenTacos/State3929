@@ -20,6 +20,7 @@ const ROUTES = {
   "/admin": renderAdmin,
   "/championship": renderChampionship,
   "/svs-signup": renderSvsSignupPage,
+  "/bears": renderBearCalculator,
 };
 // wire up stub routes for planned tools
 // Named `tool`, not `t` — `t` is the global translation lookup (see
@@ -408,11 +409,17 @@ function renderHome(el) {
         meta: t("home.svsSignupMeta").toUpperCase(),
         num: "05", iconName: "shield", tag: t("home.tagRegistration").toUpperCase(), scene: "hero", bright: true,
       })}
+      ${opCard({
+        href: "#/bears", color: "var(--accent-amber)", title: "bear_calculator",
+        desc: "Bear Trap hit planner — squad comp, gear thresholds, hit timing.",
+        meta: "ROSTER, TROOPS & AUTO SQUAD BUILDER",
+        num: "06", iconName: "paw", tag: "ANALYTICS", scene: "bear_calculator", bright: true,
+      })}
       ${PLANNED_TOOLS.map((tool, i) =>
         opCard({
           href: "#/" + tool.id, color: tool.color, title: tool.title,
           desc: tool.desc, meta: t("home.comingSoon").toUpperCase(), dim: true,
-          num: String(i + 6).padStart(2, "0"), iconName: tool.icon || "doc", tag: tool.tag, scene: tool.scene || "bear_calculator",
+          num: String(i + 7).padStart(2, "0"), iconName: tool.icon || "doc", tag: tool.tag, scene: tool.scene || "bear_calculator",
         })
       ).join("")}
     </div>
@@ -3427,6 +3434,47 @@ function championshipLanePanelHtml(key, isOverflow, w, total) {
       </div>
     </div>
   `;
+}
+
+// ---------------------------------------------------------------------------
+// Bear Squad Calculator — embedded third-party tool (github.com/QueenTacos/
+// bear-calculator), mounted here as a real React app rather than rebuilt in
+// this dashboard's own vanilla-JS style. bear-calculator.js (loaded in
+// index.html with type="text/babel", right before data.js) defines the
+// global BearSquadCalculatorApp component; React/ReactDOM/Babel standalone
+// are loaded from a CDN in that same block. The calculator keeps its own
+// state entirely in this browser's localStorage under its own "bsc_*" keys
+// (untouched by anything else in Store) — nothing here reads or writes it,
+// this function only mounts/unmounts the React tree into the route's panel.
+//
+// No sign-in gate: the calculator itself has none (it's not tied to a
+// specific member account, just whatever hero/troop data is in this
+// browser), so it's open the same way the "coming soon" stub used to be.
+let bearCalcRoot = null;
+function renderBearCalculator(el) {
+  el.innerHTML = `
+    <div class="eyebrow">// ANALYTICS</div>
+    <h1 class="page-title" style="color:var(--accent-amber)">bear_calculator</h1>
+    <div class="panel" style="padding:0;overflow:hidden;">
+      <div id="bearCalcMount"></div>
+    </div>
+  `;
+  const mount = el.querySelector("#bearCalcMount");
+  if (typeof React === "undefined" || typeof ReactDOM === "undefined" || typeof BearSquadCalculatorApp === "undefined") {
+    // Babel standalone transforms bear-calculator.js asynchronously (it
+    // fetches the file itself, separately from the browser's normal script
+    // loading), so on a very slow connection this route could in principle
+    // be opened before it's ready. Retry briefly rather than showing a
+    // dead page.
+    mount.innerHTML = `<div class="empty">Loading Bear Squad Calculator…</div>`;
+    setTimeout(() => { if (currentPath() === "/bears") renderBearCalculator(el); }, 400);
+    return;
+  }
+  // router() already cleared the previous page's DOM (innerHTML = ""), so
+  // any prior root's node is already gone — always mount a fresh root
+  // rather than reusing bearCalcRoot from a previous visit to this route.
+  bearCalcRoot = ReactDOM.createRoot(mount);
+  bearCalcRoot.render(React.createElement(BearSquadCalculatorApp));
 }
 
 function renderChampionship(el) {
