@@ -386,27 +386,64 @@ const SEED_FEEDBACK = [
 // features elsewhere in this file.
 // ---------------------------------------------------------------------------
 
-// Preset event TYPES — purely for categorization/filtering, not display
-// color (that's a separate, freely-chosen per-event color — see
+// Event TYPES — purely for categorization/filtering, not display color
+// (that's a separate, freely-chosen per-event color — see
 // EVENT_COLOR_PRESETS below). `defaultColor` is only a convenience prefill
 // when an admin picks a type in the Add Event form; it never overrides a
-// color the admin actually chose. Add more entries here if your alliance
-// tracks other recurring systems.
-const EVENT_TYPES = [
-  { id: "svs", label: "SVS (State vs State)", defaultColor: "#8B5CF6" },
-  { id: "bear_trap", label: "Bear Trap", defaultColor: "#3B82F6" },
-  { id: "castle_battle", label: "Castle Battle", defaultColor: "#EC4899" },
-  { id: "foundry_battle", label: "Foundry Battle", defaultColor: "#F97316" },
-  { id: "frost_dragon", label: "Frost Dragon / Frost Trial", defaultColor: "#06B6D4" },
-  { id: "crazy_joe", label: "Crazy Joe", defaultColor: "#EC4899" },
-  { id: "alliance_mobilization", label: "Alliance Mobilization", defaultColor: "#22C55E" },
-  { id: "alliance_championship", label: "Alliance Championship", defaultColor: "#EAB308" },
-  { id: "fishing_tournament", label: "Fishing Tournament", defaultColor: "#EAB308" },
-  { id: "arena", label: "Arena Brawl", defaultColor: "#EC4899" },
-  { id: "custom", label: "Custom / Other", defaultColor: "#8B5CF6" },
-];
+// color the admin actually chose.
+//
+// This used to be a fixed array. It's now a reusable master list — ADMIN
+// manages it from STATE DASHBOARD → SCHEDULE / EVENTS → EVENT TYPE
+// MANAGEMENT (see renderEventTypeManagementHtml in app.js) — and every
+// Event Type dropdown across the site (State/Game Calendar, Alliance
+// Calendar) reads from the SAME Store.eventTypes list, so adding one type
+// there makes it available everywhere with no code change. SEED_EVENT_TYPES
+// below is only the one-time seed/first-run default; Store.eventTypes (not
+// this constant) is the live source of truth from then on — always read
+// through Store.eventTypes / eventTypeInfo() / activeEventTypes(), never
+// this array directly.
+const SEED_EVENT_TYPES = [
+  { id: "svs", label: "SVS (State vs State)", defaultColor: "#8B5CF6", description: "", isActive: true, sortOrder: 0 },
+  { id: "bear_trap", label: "Bear Trap", defaultColor: "#3B82F6", description: "", isActive: true, sortOrder: 1 },
+  { id: "castle_battle", label: "Castle Battle", defaultColor: "#EC4899", description: "", isActive: true, sortOrder: 2 },
+  { id: "foundry_battle", label: "Foundry Battle", defaultColor: "#F97316", description: "", isActive: true, sortOrder: 3 },
+  { id: "frost_dragon", label: "Frost Dragon / Frost Trial", defaultColor: "#06B6D4", description: "", isActive: true, sortOrder: 4 },
+  { id: "crazy_joe", label: "Crazy Joe", defaultColor: "#EC4899", description: "", isActive: true, sortOrder: 5 },
+  { id: "alliance_mobilization", label: "Alliance Mobilization", defaultColor: "#22C55E", description: "", isActive: true, sortOrder: 6 },
+  { id: "alliance_championship", label: "Alliance Championship", defaultColor: "#EAB308", description: "", isActive: true, sortOrder: 7 },
+  { id: "fishing_tournament", label: "Fishing Tournament", defaultColor: "#EAB308", description: "", isActive: true, sortOrder: 8 },
+  { id: "arena", label: "Arena Brawl", defaultColor: "#EC4899", description: "", isActive: true, sortOrder: 9 },
+  { id: "custom", label: "Custom / Other", defaultColor: "#8B5CF6", description: "", isActive: true, sortOrder: 10 },
+].map((et) => ({ ...et, createdAt: "2025-01-01T00:00:00.000Z", updatedAt: "2025-01-01T00:00:00.000Z" }));
+
+// Absolute last-resort shape — only used if Store.eventTypes is ever
+// somehow empty (deleting every type isn't possible from the UI below, but
+// this keeps eventTypeInfo() from ever returning undefined).
+const FALLBACK_EVENT_TYPE = { id: "custom", label: "Custom / Other", defaultColor: "#8B5CF6", description: "", isActive: true, sortOrder: 0 };
+
+// Looks up a type by id across the FULL list (active + inactive) — a
+// deactivated or since-deleted type must still resolve correctly for any
+// event that already references it (color, label), per "don't break
+// existing events" — only NEW-event dropdowns filter to active types (see
+// activeEventTypes below).
 function eventTypeInfo(id) {
-  return EVENT_TYPES.find((et) => et.id === id) || EVENT_TYPES[EVENT_TYPES.length - 1];
+  const types = Store.eventTypes;
+  return types.find((et) => et.id === id) || types[types.length - 1] || FALLBACK_EVENT_TYPE;
+}
+
+// Active types only, in their configured display order — this is what
+// every "Add Event" Event Type dropdown across the site should build its
+// options from.
+function activeEventTypes() {
+  return Store.eventTypes.filter((et) => et.isActive !== false).slice().sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+}
+
+// Whether any stored event (state/game calendar OR any alliance's
+// calendar) currently references this Event Type — governs whether Admin
+// may permanently delete it (unused types only) vs. must deactivate it
+// (already-used types keep their history intact).
+function eventTypeInUse(id) {
+  return Store.gameEvents.some((e) => (e.eventType || e.typeId) === id) || Store.allianceCalendarEvents.some((e) => (e.eventType || e.typeId) === id);
 }
 
 // Who an event is for — exactly one, shown as a small badge alongside the
@@ -612,7 +649,7 @@ function gameCalendarEventOptions() {
 // simple named-time list an alliance's leadership keeps for its own
 // recurring commitments (e.g. "Bear Trap — 20:00 UTC daily") — deliberately
 // NOT another calendar; the real Game Calendar already exists for
-// date-based events (see EVENT_TYPES/normalizeEvent above). This is just a
+// date-based events (see SEED_EVENT_TYPES/normalizeEvent above). This is just a
 // short reference list, so LEADER/R4 don't need Admin's calendar tools.
 const SEED_ALLIANCE_EVENT_TIMES = {};
 
@@ -679,7 +716,13 @@ const ALLIANCE_TRACKING_CATEGORIES = [
   "champTrack",
   "mobilization",
 ];
-const BEAR_TRAP_ASSIGNMENTS = ["NONE", "BT1", "BT2", "BOTH"];
+// "BOTH" was removed per spec — a player may only ever hold ONE assignment
+// at a time (Neither / Bear Trap 1 / Bear Trap 2). Any record already
+// stored as "BOTH" from before this change falls through the
+// BEAR_TRAP_ASSIGNMENTS.includes() guard everywhere it's read and displays
+// as "Neither" rather than crashing — effectively clearing the invalid
+// dual-assignment the next time that admin/leader/R4 looks at it.
+const BEAR_TRAP_ASSIGNMENTS = ["NONE", "BT1", "BT2"];
 
 function allianceTrackingCategory(alliance, category) {
   const all = Store.allianceTracking;
@@ -779,6 +822,7 @@ const SUPABASE_SYNCED_DEFAULTS = {
   wos_schedule_published: SEED_SCHEDULE_PUBLISHED,
   wos_feedback: SEED_FEEDBACK,
   wos_alliances: SEED_ALLIANCES,
+  wos_event_types: SEED_EVENT_TYPES,
   wos_furnace_fc: SEED_FURNACE_FC,
   wos_alliance_colors: {},
   wos_bag_submissions: {},
@@ -870,6 +914,7 @@ const Store = {
       this._set("wos_schedule_published", SEED_SCHEDULE_PUBLISHED);
       this._set("wos_feedback", SEED_FEEDBACK);
       this._set("wos_alliances", SEED_ALLIANCES);
+      this._set("wos_event_types", SEED_EVENT_TYPES);
       this._set("wos_furnace_fc", SEED_FURNACE_FC);
       this._set("wos_alliance_colors", {});
       this._set("wos_bag_submissions", {});
@@ -1014,6 +1059,12 @@ const Store = {
   get alliances() { return this._synced("wos_alliances", SEED_ALLIANCES).get(); },
   set alliances(v) { this._synced("wos_alliances", SEED_ALLIANCES).set(v); },
 
+  // Event Type master list — single source of truth for every Event Type
+  // dropdown site-wide (State Calendar, every alliance's Calendar). See the
+  // SEED_EVENT_TYPES comment above.
+  get eventTypes() { return this._synced("wos_event_types", SEED_EVENT_TYPES).get(); },
+  set eventTypes(v) { this._synced("wos_event_types", SEED_EVENT_TYPES).set(v); },
+
   get furnaceFc() { return this._synced("wos_furnace_fc", SEED_FURNACE_FC).get(); },
   set furnaceFc(v) { this._synced("wos_furnace_fc", SEED_FURNACE_FC).set(v); },
 
@@ -1071,7 +1122,7 @@ const Store = {
   set svsSignupsOpen(v) { this._synced("wos_svs_signups_open", true).set(v); },
 
   // Game Calendar — array of event records, see SEED_GAME_EVENTS and
-  // EVENT_TYPES above, and the "Game Calendar" block in app.js.
+  // SEED_EVENT_TYPES above, and the "Game Calendar" block in app.js.
   get gameEvents() { return this._synced("wos_game_events", SEED_GAME_EVENTS).get(); },
   set gameEvents(v) { this._synced("wos_game_events", SEED_GAME_EVENTS).set(v); },
 

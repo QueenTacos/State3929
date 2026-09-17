@@ -55,6 +55,27 @@ function roleLabel(role) {
 }
 
 // ---------------------------------------------------------------------------
+// MEMBER ACCOUNT STATUS — "PENDING SETUP" vs "ACTIVE". Deliberately NOT a
+// stored field: it's derived from whether the member already has a PIN, the
+// same signal the sign-in/Reset-PIN code already keys off of (see
+// renderLoginPane / the "No Pin Yet" Admin column above). This means every
+// existing member record is automatically "ACTIVE" (they already have a
+// pin from the old required-PIN-at-creation flow or from Create Account),
+// and nothing needs a data migration or a new seeded default.
+// ---------------------------------------------------------------------------
+function memberAccountStatus(m) {
+  if (m.permanent) return "ACTIVE";
+  return m.pin ? "ACTIVE" : "PENDING_SETUP";
+}
+function accountStatusBadgeHtml(m) {
+  const pending = memberAccountStatus(m) === "PENDING_SETUP";
+  const accentVar = pending ? "var(--accent-amber)" : "var(--accent-green)";
+  return `<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.04em;white-space:nowrap;background:color-mix(in srgb, ${accentVar} 15%, transparent);color:${accentVar};border:1px solid ${accentVar};">${
+    pending ? "● PENDING SETUP" : "● ACTIVE"
+  }</span>`;
+}
+
+// ---------------------------------------------------------------------------
 // ROLE SYSTEM — four roles: admin, leader, officer (displayed as "R4"),
 // member. Hierarchy: ADMIN > LEADER > R4 > MEMBER.
 //
@@ -211,6 +232,7 @@ function openSignIn() {
       <h3>${t("auth.signInTitle")}</h3>
       <div class="tabs" style="margin-bottom:2px;">
         <button data-authtab="login" class="active">${t("auth.existingMember")}</button>
+        <button data-authtab="claim">First Time Setup</button>
         <button data-authtab="signup">${t("auth.newMember")}</button>
       </div>
       <div id="authPane"></div>
@@ -225,6 +247,7 @@ function openSignIn() {
   const showTab = (tab) => {
     tabBtns.forEach((b) => b.classList.toggle("active", b.dataset.authtab === tab));
     if (tab === "signup") renderSignUpPane(pane, overlay);
+    else if (tab === "claim") renderClaimPane(pane, overlay);
     else renderLoginPane(pane, overlay);
   };
   tabBtns.forEach((b) => b.addEventListener("click", () => showTab(b.dataset.authtab)));
@@ -333,6 +356,153 @@ function renderSignUpPane(pane, overlay) {
   };
   pane.querySelector("#suGo").onclick = go;
   pinInput.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+}
+
+// ---------------------------------------------------------------------------
+// FIRST TIME SETUP — claims a PENDING_SETUP member record that leadership
+// already created (see the Admin "Add Member" row above, which now leaves
+// off gamerId/pin entirely), rather than creating a brand-new record the
+// way the "New Member" tab does. Two steps:
+//   1) find the pending record by Gamer Name (asking for Alliance too if
+//      more than one pending record shares that name);
+//   2) let the PLAYER themselves fill in Gamer ID (prefilled if leadership
+//      already set one) and create their own PIN, then activate.
+// The existing record's id/name/alliance/role are left untouched — this
+// only ever fills in the fields leadership left blank, so there is never a
+// second, duplicate record for the same person (see updateClaimedMember).
+// ---------------------------------------------------------------------------
+function pendingMembersByName(name) {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return [];
+  return Store.members.filter((m) => !m.permanent && !m.pin && m.name.trim().toLowerCase() === needle);
+}
+
+function renderClaimPane(pane, overlay) {
+  pane.innerHTML = `
+    <p style="color:var(--text-dim);font-size:12px;margin-top:8px;">Already added by your alliance's leadership? Find your account below and finish setting it up.</p>
+    <input id="clName" placeholder="Gamer name" />
+    <div id="clAllianceField" style="display:none;">
+      <select id="clAlliance">
+        <option value="" disabled selected>Select your alliance</option>
+      </select>
+    </div>
+    <div id="clErr" style="color:var(--accent-red);font-size:11.5px;margin-top:-4px;min-height:28px;"></div>
+    <button class="btn primary" id="clFind" style="width:100%;">Find My Account</button>
+    <div id="clSetupFields"></div>
+  `;
+  const errEl = pane.querySelector("#clErr");
+  const allianceField = pane.querySelector("#clAllianceField");
+  const allianceSelect = pane.querySelector("#clAlliance");
+  const nameInput = pane.querySelector("#clName");
+  const setupFieldsEl = pane.querySelector("#clSetupFields");
+  let matchedMember = null;
+
+  const renderSetupStep = (member) => {
+    matchedMember = member;
+    pane.querySelector("#clFind").style.display = "none";
+    nameInput.disabled = true;
+    allianceSelect.disabled = true;
+    setupFieldsEl.innerHTML = `
+      <p style="color:var(--accent-green);font-size:12px;margin:10px 0 2px;">Account found for <strong>${escapeHtml(member.name)}</strong> (${escapeHtml(member.alliance || "no alliance")}). Finish setting it up below.</p>
+      <input id="clGamerId" placeholder="${t("auth.gamerIdPlaceholder")}" value="${escapeHtml(member.gamerId || "")}" />
+      <select id="clLanguage">
+        <option value="" disabled ${member.preferredLanguage ? "" : "selected"}>${t("auth.selectLanguage")}</option>
+        ${SUPPORTED_LANGUAGES.map((l) => `<option value="${l.code}" ${member.preferredLanguage === l.code ? "selected" : ""}>${escapeHtml(l.label)} — ${escapeHtml(l.englishName)}</option>`).join("")}
+      </select>
+      <input id="clPin" placeholder="Create a 4-digit PIN" inputmode="numeric" maxlength="4" style="letter-spacing:.3em;" />
+      <input id="clPinConfirm" placeholder="Confirm PIN" inputmode="numeric" maxlength="4" style="letter-spacing:.3em;" />
+      <div id="clSetupErr" style="color:var(--accent-red);font-size:11.5px;margin-top:-4px;min-height:28px;"></div>
+      <button class="btn primary" id="clActivate" style="width:100%;">Activate My Account</button>
+    `;
+    const gamerIdInput = setupFieldsEl.querySelector("#clGamerId");
+    const pinInput = setupFieldsEl.querySelector("#clPin");
+    const pinConfirmInput = setupFieldsEl.querySelector("#clPinConfirm");
+    const setupErrEl = setupFieldsEl.querySelector("#clSetupErr");
+    [pinInput, pinConfirmInput].forEach((inp) =>
+      inp.addEventListener("input", () => { inp.value = inp.value.replace(/\D/g, "").slice(0, 4); })
+    );
+    const activate = () => {
+      setupErrEl.textContent = "";
+      const gamerId = gamerIdInput.value.trim();
+      const preferredLanguage = setupFieldsEl.querySelector("#clLanguage").value;
+      const pin = pinInput.value.trim();
+      const pinConfirm = pinConfirmInput.value.trim();
+      if (!gamerId) { setupErrEl.textContent = t("auth.errEnterGamerId"); return; }
+      if (!preferredLanguage) { setupErrEl.textContent = t("auth.errSelectLanguage"); return; }
+      if (!/^\d{4}$/.test(pin)) { setupErrEl.textContent = t("auth.errPinFormat"); return; }
+      if (pin !== pinConfirm) { setupErrEl.textContent = "PINs don't match."; return; }
+
+      // Re-check against the live Store, not the closed-over `member`
+      // snapshot — this record must still exist and must still be
+      // unclaimed (no pin yet) at the moment of activation (security
+      // requirement #12: "the record is not already activated").
+      const members = Store.members;
+      const idx = members.findIndex((m) => m.id === matchedMember.id);
+      if (idx === -1) { setupErrEl.textContent = "This account no longer exists — ask your leadership to re-add you."; return; }
+      if (members[idx].pin) { setupErrEl.textContent = "This account has already been activated. Use Existing Member sign-in instead."; return; }
+      const idTaken = members.some((m) => m.id !== matchedMember.id && m.gamerId && m.gamerId.toLowerCase() === gamerId.toLowerCase());
+      if (idTaken) { setupErrEl.textContent = t("auth.errAccountExists"); return; }
+
+      // Same record, same id — just filling in what leadership left blank.
+      // Never creates a second record for this person.
+      members[idx] = { ...members[idx], gamerId, pin, preferredLanguage };
+      Store.members = members;
+      Store.currentUser = members[idx];
+      overlay.remove();
+      applyLocaleAndRerender();
+    };
+    setupFieldsEl.querySelector("#clActivate").onclick = activate;
+    pinConfirmInput.addEventListener("keydown", (e) => { if (e.key === "Enter") activate(); });
+  };
+
+  const find = () => {
+    // Capture the alliance dropdown's current selection BEFORE touching its
+    // innerHTML below — rebuilding the <select>'s options resets its value,
+    // so reading it after the rebuild always came back empty (the bug that
+    // made the alliance "change" handler never actually progress to setup).
+    const previouslySelectedAlliance = allianceSelect.value;
+    errEl.textContent = "";
+    setupFieldsEl.innerHTML = "";
+    const name = nameInput.value.trim();
+    if (!name) { errEl.textContent = t("auth.errEnterName"); return; }
+    const matches = pendingMembersByName(name);
+    if (!matches.length) {
+      errEl.textContent = "No pending account found with that name. Ask your leadership to add you first, or use New Member instead.";
+      allianceField.style.display = "none";
+      return;
+    }
+    if (matches.length === 1) {
+      allianceField.style.display = "none";
+      renderSetupStep(matches[0]);
+      return;
+    }
+    // Same Gamer Name pending in more than one alliance — ask which one.
+    // Only rebuild the option list when the candidate set actually changed
+    // (a fresh name lookup), so a later re-run from the alliance <select>'s
+    // own "change" event doesn't wipe out the selection it just fired for.
+    const candidateKey = matches.map((m) => m.id).sort().join(",");
+    if (allianceSelect.dataset.candidateKey !== candidateKey) {
+      allianceSelect.dataset.candidateKey = candidateKey;
+      allianceSelect.innerHTML = `
+        <option value="" disabled selected>Select your alliance</option>
+        ${matches.map((m) => `<option value="${escapeHtml(m.alliance || "")}">${escapeHtml(m.alliance || "No alliance")}</option>`).join("")}
+      `;
+    } else if (previouslySelectedAlliance) {
+      allianceSelect.value = previouslySelectedAlliance;
+    }
+    allianceField.style.display = "block";
+    const allianceValue = allianceSelect.value;
+    if (!allianceValue) {
+      errEl.textContent = "More than one pending account has that name — select your alliance to continue.";
+      return;
+    }
+    const exact = matches.find((m) => (m.alliance || "") === allianceValue);
+    if (!exact) { errEl.textContent = "Couldn't match that alliance — try again."; return; }
+    renderSetupStep(exact);
+  };
+  pane.querySelector("#clFind").onclick = find;
+  allianceSelect.addEventListener("change", find);
+  nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") find(); });
 }
 
 // ---------------------------------------------------------------------------
@@ -3150,6 +3320,18 @@ function renderAdmin(el) {
   }
   const stateDashboardTabs = ADMIN_TABS.filter((tb) => STATE_DASHBOARD_TAB_IDS.includes(tb.id));
 
+  // Role choices available in the "Add Member" row below, gated the same
+  // way as the existing per-row role-change select just above it: true
+  // ADMIN can hand out any role, LEADER (canManageR4Roles but officerScoped)
+  // can create R4/Member within their own alliance, and R4 itself can only
+  // ever add plain Members — matching "R4 should be able to add normal
+  // Members but should NOT be able to assign R4/Leader roles."
+  const addMemberRoleOptions = !officerScoped
+    ? ["member", "officer", "leader", "admin"]
+    : canManageR4Roles(user)
+    ? ["member", "officer"]
+    : ["member"];
+
   el.innerHTML = `
     <div class="eyebrow">// ${t("admin.eyebrow").toUpperCase()}</div>
     <h1 class="page-title" style="color:var(--accent-gold)">admin</h1>
@@ -3274,7 +3456,7 @@ function renderAdmin(el) {
       </div>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>${t("admin.userName").toUpperCase()}</th><th>${t("admin.gamerId").toUpperCase()}</th><th>${t("admin.alliance").toUpperCase()}</th><th>${t("admin.languageColumn").toUpperCase()}</th><th>${t("admin.resetPin").toUpperCase()}</th><th>${t("admin.rank").toUpperCase()}</th><th></th></tr></thead>
+          <thead><tr><th>${t("admin.userName").toUpperCase()}</th><th>${t("admin.gamerId").toUpperCase()}</th><th>${t("admin.alliance").toUpperCase()}</th><th>${t("admin.languageColumn").toUpperCase()}</th><th>${t("admin.resetPin").toUpperCase()}</th><th>${t("admin.rank").toUpperCase()}</th><th>ACCOUNT STATUS</th><th></th></tr></thead>
           <tbody>
             ${members
               .filter((m) => !adminMemberLangFilter || (m.preferredLanguage || DEFAULT_LANGUAGE_CODE) === adminMemberLangFilter)
@@ -3319,6 +3501,7 @@ function renderAdmin(el) {
                         </select>`
                   }
                 </td>
+                <td>${accountStatusBadgeHtml(m)}</td>
                 <td>
                   <div style="display:flex;gap:6px;justify-content:flex-end;flex-wrap:nowrap;">
                     ${canEditMemberBag(user) ? `<button data-medit2="${m.id}" class="btn small" style="white-space:nowrap;">${t("admin.editBag")}</button>` : ""}
@@ -3327,16 +3510,27 @@ function renderAdmin(el) {
                 </td>
               </tr>`
               )
-              .join("") || `<tr><td colspan="7">${t("admin.noMembersYet")}</td></tr>`}
+              .join("") || `<tr><td colspan="8">${t("admin.noMembersYet")}</td></tr>`}
           </tbody>
         </table>
       </div>
-      <div style="display:flex;gap:8px;margin-top:10px;">
-        <input id="admNewMember" placeholder="${t("admin.newMemberName")}" style="flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;" />
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        <input id="admNewMember" placeholder="Gamer name" style="flex:1 1 160px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;" />
+        ${
+          officerScoped
+            ? ""
+            : `<select id="admNewMemberAlliance" style="background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;">
+                <option value="" ${!alliances.length ? "selected" : ""} disabled>${alliances.length ? "Select alliance" : "No alliances yet"}</option>
+                ${alliances.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join("")}
+              </select>`
+        }
+        <select id="admNewMemberRole" style="background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;">
+          ${addMemberRoleOptions.map((r) => `<option value="${r}" ${r === "member" ? "selected" : ""}>${roleLabel(r)}</option>`).join("")}
+        </select>
         <input id="admNewGamerId" placeholder="${t("admin.gamerIdOptional")}" style="width:150px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;" />
-        <input id="admNewPin" placeholder="${t("admin.newPinPlaceholder")}" inputmode="numeric" maxlength="4" style="width:110px;letter-spacing:.2em;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:8px 10px;font-size:12px;" />
         <button class="btn small primary" id="admAddMember">${t("admin.addMember")}</button>
       </div>
+      <p style="font-size:11px;color:var(--text-faint);margin:8px 0 0;">No PIN needed yet — they'll be added as <strong style="color:var(--accent-amber);">PENDING SETUP</strong> and can set up their own account (Gamer ID + PIN) the first time they sign in, via "First Time Setup" on the sign-in screen.</p>
     </div>
     `
     }
@@ -3456,6 +3650,8 @@ function renderAdmin(el) {
       </div>
       <p style="font-size:10.5px;color:var(--text-faint);margin:10px 0 0;">Publish or unpublish a day from that day's SVS Battle Prep page.</p>
     </div>
+
+    ${renderEventTypeManagementHtml()}
     `
     }
 
@@ -3515,6 +3711,7 @@ function renderAdmin(el) {
     })
   );
   el.querySelector("#admOpenCalendar")?.addEventListener("click", () => navigate("/calendar"));
+  wireEventTypeManagement(el);
 
   el.querySelector("#admAddAlliance")?.addEventListener("click", () => {
     const tag = el.querySelector("#admNewAlliance").value.trim();
@@ -3688,23 +3885,43 @@ function renderAdmin(el) {
       renderAdmin(el);
     })
   );
-  el.querySelector("#admNewPin")?.addEventListener("input", (e) => {
-    e.target.value = e.target.value.replace(/\D/g, "").slice(0, 4);
-  });
   el.querySelector("#admAddMember")?.addEventListener("click", () => {
     const name = el.querySelector("#admNewMember").value.trim();
     const gamerId = el.querySelector("#admNewGamerId").value.trim();
-    const pin = el.querySelector("#admNewPin").value.trim();
     if (!name) return;
-    if (!/^\d{4}$/.test(pin)) {
-      alert("Enter a 4-digit PIN for this member so they can sign in.");
-      return;
-    }
+
     // Officers only ever see their own alliance here, so a member they add
     // needs that alliance from the start — otherwise it'd default blank and
-    // immediately vanish from their filtered table.
-    const alliance = officerScoped ? user.alliance || "" : "";
-    Store.members = [...Store.members, { id: "m" + Date.now(), name, gamerId, alliance, role: "member", pin, preferredLanguage: DEFAULT_LANGUAGE_CODE }];
+    // immediately vanish from their filtered table. True ADMIN picks any
+    // alliance from the new selector.
+    const alliance = officerScoped ? user.alliance || "" : (el.querySelector("#admNewMemberAlliance")?.value || "").trim();
+    if (!officerScoped && !alliance) {
+      alert("Select an alliance for this member.");
+      return;
+    }
+
+    // Role is picked from the gated addMemberRoleOptions list above — R4
+    // never sees anything but "member" in that dropdown, LEADER never sees
+    // "leader"/"admin", so no extra client-side clamping is needed here,
+    // but the value is still re-validated against that same list as
+    // defense in depth (matches the rest of this app's pattern of every
+    // handler re-checking permissions itself, not just relying on hidden UI).
+    const requestedRole = (el.querySelector("#admNewMemberRole")?.value || "member").trim();
+    const role = addMemberRoleOptions.includes(requestedRole) ? requestedRole : "member";
+
+    if (gamerId && Store.members.some((m) => m.gamerId && m.gamerId.toLowerCase() === gamerId.toLowerCase())) {
+      alert("That Gamer ID is already in use by another member.");
+      return;
+    }
+
+    // Deliberately NO pin here — leadership can add a member knowing only
+    // their gamer name, alliance, and role (per the "add a member before
+    // they have a Gamer ID or PIN" requirement). The record is left with no
+    // pin, which memberAccountStatus() reads as PENDING_SETUP; the member
+    // later claims this exact record and sets their own PIN via "First
+    // Time Setup" on the sign-in screen (see renderClaimPane below) —
+    // never a second, duplicate record.
+    Store.members = [...Store.members, { id: "m" + Date.now(), name, gamerId, alliance, role, pin: "", preferredLanguage: DEFAULT_LANGUAGE_CODE }];
     renderAdmin(el);
   });
   el.querySelector("#admMemberLangFilter")?.addEventListener("change", (e) => {
@@ -4092,9 +4309,18 @@ function renderMobilizationOverviewCardHtml(viewingAlliance, members) {
   `;
 }
 
-function renderBearTrapOverviewCardHtml(viewingAlliance, members) {
+// `canManage` here is the same isAdmin(user) check used everywhere else on
+// this dashboard (despite the name, true for ADMIN/LEADER/R4 — see the
+// ROLE SYSTEM comment near isAdmin's definition — and false for MEMBER), so
+// this card gets the same live-editable dropdown as the full "View All"
+// list (renderBearTrapBodyHtml) for exactly the roles allowed to manage
+// Bear Trap assignments, while MEMBER still only ever sees the plain label.
+// The <select> uses the same data-trackdd="beartrap|<id>|assignment"
+// attribute the rest of this file's tracking inputs use, so it's already
+// picked up for free by wireAllianceTrackingInputs — no extra wiring here.
+function renderBearTrapOverviewCardHtml(viewingAlliance, members, canManage) {
   const cat = allianceTrackingCategory(viewingAlliance, "beartrap");
-  const optionLabel = { NONE: "Neither", BT1: "Bear Trap 1", BT2: "Bear Trap 2", BOTH: "Both" };
+  const optionLabel = { NONE: "Neither", BT1: "Bear Trap 1", BT2: "Bear Trap 2" };
   const rows = members.slice(0, 6);
   return `
     <div class="panel" style="${accentPanelStyle("var(--accent-amber)")}">
@@ -4109,7 +4335,13 @@ function renderBearTrapOverviewCardHtml(viewingAlliance, members) {
                     .map((m) => {
                       const raw = cat[m.id]?.assignment;
                       const v = BEAR_TRAP_ASSIGNMENTS.includes(raw) ? raw : "NONE";
-                      return `<tr><td>${escapeHtml(m.name)}</td><td>${optionLabel[v]}</td></tr>`;
+                      return `<tr><td>${escapeHtml(m.name)}</td><td>${
+                        canManage
+                          ? `<select data-trackdd="beartrap|${m.id}|assignment" style="${trackInputStyle}">
+                              ${BEAR_TRAP_ASSIGNMENTS.map((a) => `<option value="${a}" ${a === v ? "selected" : ""}>${optionLabel[a]}</option>`).join("")}
+                            </select>`
+                          : optionLabel[v]
+                      }</td></tr>`;
                     })
                     .join("")
                 : `<tr><td colspan="2">No members yet.</td></tr>`
@@ -4199,7 +4431,7 @@ function renderAllianceDashOverviewHtml(user, viewingAlliance, members, bagSubs,
       ${renderParticipationOverviewCardHtml(viewingAlliance, members)}
       ${renderRuleViolationsOverviewCardHtml(viewingAlliance)}
       ${renderMobilizationOverviewCardHtml(viewingAlliance, members)}
-      ${renderBearTrapOverviewCardHtml(viewingAlliance, members)}
+      ${renderBearTrapOverviewCardHtml(viewingAlliance, members, canManage)}
       ${renderRemindersOverviewCardHtml(viewingAlliance, canManage)}
     </div>
 
@@ -4502,6 +4734,25 @@ function wireAllianceCalendarSection(el, allianceId, canManage, rerender) {
   );
 }
 
+// Builds the <option> list for every "EVENT TYPE" <select> site-wide, from
+// the shared, Admin-managed Store.eventTypes list (see EVENT TYPE
+// MANAGEMENT above) — ACTIVE types only, in their configured order, so a
+// deactivated type stops being offered for NEW events. If the event being
+// edited already has a type that's since gone inactive (or been deleted),
+// that type is still included — pinned to the top and marked "(inactive)"
+// — so opening Edit on an old event never silently swaps its type out from
+// under it (see "don't break existing events" in the Event Type spec).
+function eventTypeDropdownOptionsHtml(selectedTypeId) {
+  const active = activeEventTypes();
+  const selectedIsActive = active.some((et) => et.id === selectedTypeId);
+  const current = !selectedIsActive && selectedTypeId ? Store.eventTypes.find((et) => et.id === selectedTypeId) : null;
+  const options = current ? [{ ...current, label: `${current.label} (inactive)` }, ...active] : active;
+  return options.map((et) => `<option value="${et.id}" ${et.id === selectedTypeId ? "selected" : ""}>${escapeHtml(et.label)}</option>`).join("");
+}
+function firstActiveEventTypeId() {
+  return activeEventTypes()[0]?.id || Store.eventTypes[0]?.id || "custom";
+}
+
 // Add/Edit modal for one alliance's own calendar — same field set as the
 // Game Calendar's openEventModal, minus EVENT SCOPE (an Alliance Calendar
 // event's scope is implicitly ALLIANCE, tied to allianceId, per spec — no
@@ -4510,7 +4761,7 @@ function openAllianceEventModal(allianceId, existingRaw, presetDate, rerender) {
   const existing = existingRaw ? normalizeEvent(existingRaw) : null;
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
-  const typeId = existing?.eventType || EVENT_TYPES[0].id;
+  const typeId = existing?.eventType || firstActiveEventTypeId();
   let selectedColor = existing?.color || eventTypeInfo(typeId).defaultColor || DEFAULT_EVENT_COLOR;
 
   overlay.innerHTML = `
@@ -4524,7 +4775,7 @@ function openAllianceEventModal(allianceId, existingRaw, presetDate, rerender) {
       <div class="field">
         <label>EVENT TYPE</label>
         <select id="aevType">
-          ${EVENT_TYPES.map((et) => `<option value="${et.id}" ${et.id === typeId ? "selected" : ""}>${et.label}</option>`).join("")}
+          ${eventTypeDropdownOptionsHtml(typeId)}
         </select>
       </div>
       <div class="field-row">
@@ -4923,6 +5174,10 @@ function wireAllianceDashboardTab(el, user, officerScoped) {
       router();
     })
   );
+  el.querySelector("#beartrapFilter")?.addEventListener("change", (e) => {
+    bearTrapViewFilter = e.target.value;
+    router();
+  });
 
   // Overview hub — "jump to tab" shortcut buttons scattered across the new
   // Overview cards (Quick Actions, and each card's own "View All ›" style
@@ -5417,20 +5672,41 @@ function renderCheckboxTrackerBodyHtml(viewingAlliance, members, canManage, cate
   `;
 }
 
+// Optional filter for the full Bear Trap Assignments list ("View All") —
+// purely a display filter, never touches storage. ALL is the default so
+// this never hides anyone unless someone deliberately narrows it.
+let bearTrapViewFilter = "ALL";
+const BEAR_TRAP_FILTER_OPTIONS = [
+  { value: "ALL", label: "All" },
+  { value: "BT1", label: "Bear Trap 1" },
+  { value: "BT2", label: "Bear Trap 2" },
+  { value: "NONE", label: "Neither" },
+];
+
 function renderBearTrapBodyHtml(viewingAlliance, members, canManage) {
   const cat = allianceTrackingCategory(viewingAlliance, "beartrap");
-  const optionLabel = { NONE: "Neither", BT1: "Bear Trap 1", BT2: "Bear Trap 2", BOTH: "Both" };
+  const optionLabel = { NONE: "Neither", BT1: "Bear Trap 1", BT2: "Bear Trap 2" };
+  const rowsAll = members.map((m) => {
+    const rec = cat[m.id] || {};
+    const value = BEAR_TRAP_ASSIGNMENTS.includes(rec.assignment) ? rec.assignment : "NONE";
+    return { m, value };
+  });
+  const rows = bearTrapViewFilter === "ALL" ? rowsAll : rowsAll.filter((r) => r.value === bearTrapViewFilter);
   return `
+    <div class="field" style="max-width:220px;margin-bottom:10px;">
+      <label>FILTER</label>
+      <select id="beartrapFilter">
+        ${BEAR_TRAP_FILTER_OPTIONS.map((o) => `<option value="${o.value}" ${o.value === bearTrapViewFilter ? "selected" : ""}>${o.label}</option>`).join("")}
+      </select>
+    </div>
     <div style="overflow-x:auto;">
       <table>
         <thead><tr><th>PLAYER</th><th>BEAR TRAP ASSIGNMENT</th></tr></thead>
         <tbody>
           ${
-            members
-              .map((m) => {
-                const rec = cat[m.id] || {};
-                const value = BEAR_TRAP_ASSIGNMENTS.includes(rec.assignment) ? rec.assignment : "NONE";
-                return `
+            rows
+              .map(
+                ({ m, value }) => `
           <tr>
             <td>${escapeHtml(m.name)}</td>
             <td>
@@ -5442,9 +5718,9 @@ function renderBearTrapBodyHtml(viewingAlliance, members, canManage) {
                   : optionLabel[value]
               }
             </td>
-          </tr>`;
-              })
-              .join("") || `<tr><td colspan="2">No members yet.</td></tr>`
+          </tr>`
+              )
+              .join("") || `<tr><td colspan="2">${members.length ? "No members match this filter." : "No members yet."}</td></tr>`
           }
         </tbody>
       </table>
@@ -6353,7 +6629,7 @@ function renderBearCalculator(el) {
 
 // ---------------------------------------------------------------------------
 // Game Calendar — admin/officer-managed schedule of recurring Whiteout
-// Survival systems (see EVENT_TYPES/EVENT_SCOPES/EVENT_COLOR_PRESETS +
+// Survival systems (see SEED_EVENT_TYPES/EVENT_SCOPES/EVENT_COLOR_PRESETS +
 // SEED_GAME_EVENTS in data.js). Regular members get a read-only month view
 // + upcoming list; isAdmin(user) also gets Add/Edit/Delete. Editing a
 // recurring event edits the whole series (there's no per-occurrence
@@ -6368,6 +6644,218 @@ function renderBearCalculator(el) {
 // re-clipped to that row (so it still looks continuous) but stays one
 // event the whole way — no duplicate records are ever created for it.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// EVENT TYPE MANAGEMENT — ADMIN-only reusable master list of Event Types
+// (STATE DASHBOARD → SCHEDULE / EVENTS → EVENT TYPE MANAGEMENT below).
+// This is NOT individual scheduled calendar events — it's the shared
+// dropdown source every Event Type <select> across the site (State/Game
+// Calendar's openEventModal, every alliance's Calendar's
+// openAllianceEventModal) reads from via Store.eventTypes / eventTypeInfo()
+// / activeEventTypes() (data.js). Adding a type here makes it available in
+// every one of those dropdowns immediately — no separate per-calendar list,
+// no code change (see the big comment above SEED_EVENT_TYPES in data.js).
+//
+// `eventTypeEditingId` drives one shared add/edit form: null = no form
+// open, "__new__" = the Add form, or an existing type's id = editing that
+// row in place. Only one instance can be open at a time, same pattern as
+// this file's other single-row-edit admin lists.
+// ---------------------------------------------------------------------------
+let eventTypeEditingId = null;
+let eventTypeFormColor = DEFAULT_EVENT_COLOR;
+
+function renderEventTypeManagementHtml() {
+  const types = Store.eventTypes.slice().sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+  return `
+    <div class="panel">
+      <div class="planner-header"><strong>Event Type Management</strong></div>
+      <p style="font-size:11.5px;color:var(--text-dim);margin-top:-6px;">
+        The single shared list of Event Types offered in every Add Event form site-wide (State Calendar and every alliance's Calendar). Add a type here and it appears everywhere automatically — no separate lists to update.
+      </p>
+      <div style="display:flex;flex-direction:column;gap:8px;margin:12px 0;">
+        ${
+          types.map((et, i) => renderEventTypeRowHtml(et, i, types.length)).join("") ||
+          `<div class="empty">No event types yet.</div>`
+        }
+      </div>
+      ${
+        eventTypeEditingId === "__new__"
+          ? renderEventTypeFormHtml(null)
+          : `<button class="btn small primary" id="evtypeAddBtn">+ ADD EVENT TYPE</button>`
+      }
+    </div>
+  `;
+}
+
+function renderEventTypeRowHtml(et, index, total) {
+  if (eventTypeEditingId === et.id) return renderEventTypeFormHtml(et);
+  const inUse = eventTypeInUse(et.id);
+  return `
+    <div style="display:flex;align-items:center;gap:10px;background:var(--panel-2);border:1px solid var(--border);border-radius:4px;padding:8px 10px;flex-wrap:wrap;">
+      <span style="width:16px;height:16px;border-radius:4px;flex:none;background:${et.defaultColor};border:1px solid rgba(255,255,255,.25);"></span>
+      <div style="flex:1 1 160px;min-width:0;">
+        <div style="font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          ${escapeHtml(et.label)}
+          <span class="status-badge ${et.isActive === false ? "open" : "done"}">${et.isActive === false ? "INACTIVE" : "ACTIVE"}</span>
+          ${inUse ? `<span style="font-size:10px;color:var(--text-faint);">· in use</span>` : ""}
+        </div>
+        ${et.description ? `<div style="font-size:11px;color:var(--text-faint);margin-top:2px;">${escapeHtml(et.description)}</div>` : ""}
+      </div>
+      <div style="display:flex;gap:4px;align-items:center;flex:none;">
+        <button data-evtypeup="${et.id}" class="btn small" ${index === 0 ? "disabled" : ""} title="Move up">↑</button>
+        <button data-evtypedown="${et.id}" class="btn small" ${index === total - 1 ? "disabled" : ""} title="Move down">↓</button>
+        <button data-evtypeedit="${et.id}" class="btn small">Edit</button>
+        <button data-evtypetoggleactive="${et.id}" class="btn small">${et.isActive === false ? "Activate" : "Deactivate"}</button>
+        <button data-evtypedelete="${et.id}" class="btn small" style="${inUse ? "opacity:.4;cursor:not-allowed;" : "color:var(--accent-red);"}" ${inUse ? `disabled title="In use by an existing event — deactivate instead of deleting."` : "title=\"Permanently delete (only allowed while unused)\""}>✕</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderEventTypeFormHtml(existing) {
+  const selectedColor = existing ? eventTypeFormColor || existing.defaultColor : eventTypeFormColor;
+  return `
+    <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:4px;padding:12px;margin-top:${existing ? "0" : "4px"};">
+      <div class="field-row">
+        <div class="field" style="flex:1;min-width:180px;">
+          <label>EVENT TYPE NAME</label>
+          <input id="evtypeName" placeholder="e.g. Mercenary Prestige" value="${existing ? escapeHtml(existing.label) : ""}" />
+        </div>
+        <div class="field" style="flex:1;min-width:180px;">
+          <label>DESCRIPTION (OPTIONAL)</label>
+          <input id="evtypeDescription" placeholder="—" value="${existing ? escapeHtml(existing.description || "") : ""}" />
+        </div>
+      </div>
+      <div class="field">
+        <label>DEFAULT COLOR</label>
+        <div class="cal-color-row">
+          ${EVENT_COLOR_PRESETS.map(
+            (c) =>
+              `<button type="button" class="cal-color-swatch${c.value.toLowerCase() === selectedColor.toLowerCase() ? " selected" : ""}" data-evtypecolor="${c.value}" style="background:${c.value};" title="${c.name}"></button>`
+          ).join("")}
+          <label class="cal-color-swatch cal-color-custom" title="Custom color" style="background:${selectedColor};">
+            <input type="color" id="evtypeColorCustom" value="${/^#[0-9a-f]{6}$/i.test(selectedColor) ? selectedColor : DEFAULT_EVENT_COLOR}" />
+          </label>
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-dim);margin:10px 0;">
+        <input type="checkbox" id="evtypeActive" ${!existing || existing.isActive !== false ? "checked" : ""} />
+        Active (appears in Add Event dropdowns)
+      </label>
+      <div id="evtypeErr" style="color:var(--accent-red);font-size:11.5px;margin:-2px 0 8px;min-height:16px;"></div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn small primary" id="evtypeSave" data-evtypeediting="${existing ? existing.id : ""}">${existing ? "SAVE CHANGES" : "SAVE EVENT TYPE"}</button>
+        <button class="btn small" id="evtypeCancel">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+function wireEventTypeManagement(el) {
+  el.querySelector("#evtypeAddBtn")?.addEventListener("click", () => {
+    eventTypeEditingId = "__new__";
+    eventTypeFormColor = DEFAULT_EVENT_COLOR;
+    renderAdmin(el);
+  });
+  el.querySelectorAll("[data-evtypeedit]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const et = Store.eventTypes.find((x) => x.id === btn.dataset.evtypeedit);
+      eventTypeEditingId = btn.dataset.evtypeedit;
+      eventTypeFormColor = et?.defaultColor || DEFAULT_EVENT_COLOR;
+      renderAdmin(el);
+    })
+  );
+  el.querySelector("#evtypeCancel")?.addEventListener("click", () => {
+    eventTypeEditingId = null;
+    renderAdmin(el);
+  });
+  const colorSwatches = el.querySelectorAll(".cal-color-swatch[data-evtypecolor]");
+  const customSwatch = el.querySelector(".cal-color-custom");
+  const customInput = el.querySelector("#evtypeColorCustom");
+  colorSwatches.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      eventTypeFormColor = btn.dataset.evtypecolor;
+      colorSwatches.forEach((b) => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      if (customInput) customInput.value = eventTypeFormColor;
+      if (customSwatch) customSwatch.style.background = eventTypeFormColor;
+    });
+  });
+  customInput?.addEventListener("input", () => {
+    eventTypeFormColor = customInput.value;
+    colorSwatches.forEach((b) => b.classList.remove("selected"));
+    if (customSwatch) customSwatch.style.background = eventTypeFormColor;
+  });
+  el.querySelector("#evtypeSave")?.addEventListener("click", (e) => {
+    const errEl = el.querySelector("#evtypeErr");
+    const name = el.querySelector("#evtypeName").value.trim();
+    if (!name) { errEl.textContent = "Event Type name is required."; return; }
+    const description = el.querySelector("#evtypeDescription").value.trim();
+    const isActive = el.querySelector("#evtypeActive").checked;
+    const editingId = e.target.dataset.evtypeediting;
+    const types = Store.eventTypes;
+    const now = new Date().toISOString();
+    if (editingId) {
+      Store.eventTypes = types.map((t) =>
+        t.id === editingId ? { ...t, label: name, description, defaultColor: eventTypeFormColor, isActive, updatedAt: now } : t
+      );
+    } else {
+      const nextSortOrder = types.length ? Math.max(...types.map((t) => t.sortOrder ?? 0)) + 1 : 0;
+      const id = "evtype" + Date.now();
+      Store.eventTypes = [...types, { id, label: name, description, defaultColor: eventTypeFormColor, isActive, sortOrder: nextSortOrder, createdAt: now, updatedAt: now }];
+    }
+    eventTypeEditingId = null;
+    renderAdmin(el);
+  });
+  el.querySelectorAll("[data-evtypetoggleactive]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.evtypetoggleactive;
+      const types = Store.eventTypes;
+      Store.eventTypes = types.map((t) => (t.id === id ? { ...t, isActive: t.isActive === false, updatedAt: new Date().toISOString() } : t));
+      renderAdmin(el);
+    })
+  );
+  el.querySelectorAll("[data-evtypedelete]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.evtypedelete;
+      if (eventTypeInUse(id)) { alert("This Event Type is used by an existing event — deactivate it instead of deleting."); return; }
+      const et = Store.eventTypes.find((t) => t.id === id);
+      if (!confirm(`Permanently delete "${et?.label || "this Event Type"}"? This can't be undone.`)) return;
+      Store.eventTypes = Store.eventTypes.filter((t) => t.id !== id);
+      if (eventTypeEditingId === id) eventTypeEditingId = null;
+      renderAdmin(el);
+    })
+  );
+  el.querySelectorAll("[data-evtypeup]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      swapEventTypeSortOrder(btn.dataset.evtypeup, -1);
+      renderAdmin(el);
+    })
+  );
+  el.querySelectorAll("[data-evtypedown]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      swapEventTypeSortOrder(btn.dataset.evtypedown, 1);
+      renderAdmin(el);
+    })
+  );
+}
+
+// Swaps this type's sortOrder with its immediate neighbor in the given
+// direction (-1 = up/earlier, 1 = down/later) — a simple adjacent-swap
+// reorder, sufficient for a short admin-curated list like this one.
+function swapEventTypeSortOrder(id, direction) {
+  const types = Store.eventTypes.slice().sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+  const i = types.findIndex((t) => t.id === id);
+  const j = i + direction;
+  if (i === -1 || j < 0 || j >= types.length) return;
+  const a = types[i], b = types[j];
+  const aOrder = a.sortOrder ?? 0, bOrder = b.sortOrder ?? 0;
+  Store.eventTypes = Store.eventTypes.map((t) => {
+    if (t.id === a.id) return { ...t, sortOrder: bOrder };
+    if (t.id === b.id) return { ...t, sortOrder: aOrder };
+    return t;
+  });
+}
+
 let calendarViewDate = (() => { const d = new Date(); d.setDate(1); return d; })();
 let calendarSelectedDate = null; // "YYYY-MM-DD" | null — null = show upcoming list instead of one day
 
@@ -6704,7 +7192,7 @@ function openEventModal(pageEl, existingRaw, presetDate) {
   const existing = existingRaw ? normalizeEvent(existingRaw) : null;
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
-  const typeId = existing?.eventType || EVENT_TYPES[0].id;
+  const typeId = existing?.eventType || firstActiveEventTypeId();
   const scope = existing?.scope || "ALLIANCE";
   let selectedColor = existing?.color || eventTypeInfo(typeId).defaultColor || DEFAULT_EVENT_COLOR;
 
@@ -6719,7 +7207,7 @@ function openEventModal(pageEl, existingRaw, presetDate) {
       <div class="field">
         <label>EVENT TYPE</label>
         <select id="evType">
-          ${EVENT_TYPES.map((et) => `<option value="${et.id}" ${et.id === typeId ? "selected" : ""}>${et.label}</option>`).join("")}
+          ${eventTypeDropdownOptionsHtml(typeId)}
         </select>
       </div>
       <div class="field">
