@@ -1185,6 +1185,7 @@ const ALLIANCE_DASH_SUBTABS = [
   { id: "calendar", label: "Calendar" },
   { id: "notifications", label: "Notifications" },
   { id: "event-times", label: "Event Times" },
+  { id: "facilities", label: "Facilities" },
   { id: "participation", label: "Participation" },
   { id: "performance", label: "Performance" },
   { id: "discipline", label: "Discipline" },
@@ -4114,12 +4115,24 @@ function renderAllianceDashboardTabHtml(user, officerScoped) {
           </div>`
     )}
 
-    ${pillTabsHtml(ALLIANCE_DASH_SUBTABS, allianceDashSubTab, "adsubtab")}
+    ${pillTabsHtml(
+      // FACILITIES is leadership-only (ADMIN/LEADER/R4) — a plain MEMBER
+      // never even sees the tab button, and the route-level guard below
+      // (allianceDashSubTab === "facilities" && !isAdmin(user)) blocks
+      // direct access too, in case a MEMBER had it selected before their
+      // role changed. See spec sections 1/37/44 — this is a client-side-only
+      // guard, same limitation as everywhere else permissions are enforced
+      // in this codebase (no server-side authorization layer exists here).
+      isAdmin(user) ? ALLIANCE_DASH_SUBTABS : ALLIANCE_DASH_SUBTABS.filter((tb) => tb.id !== "facilities"),
+      allianceDashSubTab,
+      "adsubtab"
+    )}
 
     ${allianceDashSubTab !== "overview" ? "" : renderAllianceDashOverviewHtml(user, viewingAlliance, members, bagSubs, svsSignups)}
     ${allianceDashSubTab !== "calendar" ? "" : renderAllianceCalendarHtml(viewingAlliance, isAdmin(user))}
     ${allianceDashSubTab !== "notifications" ? "" : renderAllianceNotificationsPanelHtml(user, viewingAlliance, isAdmin(user))}
     ${allianceDashSubTab !== "event-times" ? "" : renderAllianceDashEventTimesHtml(viewingAlliance, isAdmin(user))}
+    ${allianceDashSubTab !== "facilities" || !isAdmin(user) ? "" : renderFacilitiesHtml(viewingAlliance, members, isAdmin(user))}
     ${allianceDashSubTab !== "participation" ? "" : renderAllianceDashParticipationHtml(viewingAlliance, members, bagSubs, svsSignups, isAdmin(user))}
     ${allianceDashSubTab !== "performance" ? "" : renderAllianceDashPerformanceHtml(viewingAlliance, members, bagSubs, isAdmin(user))}
     ${allianceDashSubTab !== "discipline" ? "" : renderAllianceDashDisciplineHtml(viewingAlliance, isAdmin(user))}
@@ -5167,6 +5180,7 @@ function wireAllianceDashboardTab(el, user, officerScoped) {
   // Times/Discipline above.
   const allianceDashMembers = Store.members.filter((m) => m.alliance === viewingAlliance);
   wireR4JobsSection(el, user, viewingAlliance, allianceDashMembers, isAdmin(user));
+  if (allianceDashSubTab === "facilities" && isAdmin(user)) wireFacilitiesSection(el, user, viewingAlliance, allianceDashMembers, isAdmin(user));
   wireAllianceTrackingInputs(el, user, viewingAlliance, isAdmin(user));
   el.querySelectorAll("[data-parttrackertab]").forEach((btn) =>
     btn.addEventListener("click", () => {
@@ -5534,6 +5548,452 @@ function wireR4JobsSection(el, user, viewingAlliance, members, canManage) {
       router();
     })
   );
+}
+
+// ---------------------------------------------------------------------------
+// Alliance Dashboard — Facilities. ADDITIVE, leadership-only (ADMIN/LEADER/R4)
+// tab — see FACILITY_DEFINITIONS/SEED_ALLIANCE_FACILITIES in data.js for the
+// fixed game reference data and the per-alliance record store. Reuses the
+// existing alliance selector (allianceDashboardViewingAlliance) rather than
+// building a new one, and the existing pill-tab bar/panel styling — nothing
+// about the rest of the Alliance Dashboard is touched.
+//
+// IMPORTANT LIMITATION (flagged consistently with every other "must be
+// enforced server-side" requirement in this app): this codebase has no real
+// backend/server-side authorization layer anywhere — Supabase RLS is
+// wide-open and there is no server-side validation of any kind. The
+// ADMIN/LEADER-R4/MEMBER permission model and the Type/Level/Coordinate
+// validation below are enforced client-side only, the same as every other
+// permission check in this app.
+// ---------------------------------------------------------------------------
+const FACILITY_TYPE_ACCENT = {
+  CONSTRUCTION: "var(--accent-amber)",
+  TECH: "var(--console-icecyan)",
+  DEFENSE: "var(--accent-green)",
+  WEAPON: "var(--accent-red)",
+  GATHERING: "var(--accent-gold)",
+  PRODUCTION: "var(--accent-purple)",
+  TRAINING: "var(--console-icy-blue)",
+  EXPEDITION: "var(--console-magenta)",
+};
+const FACILITY_STATUS_BADGE_STYLE = {
+  TARGET: "background:color-mix(in srgb, var(--console-icecyan) 18%, transparent);color:var(--console-icecyan);border:1px solid var(--console-icecyan);",
+  CONTESTED: "background:color-mix(in srgb, var(--accent-gold) 18%, transparent);color:var(--accent-gold);border:1px solid var(--accent-gold);",
+  OWNED: "background:color-mix(in srgb, var(--accent-green) 18%, transparent);color:var(--accent-green);border:1px solid var(--accent-green);",
+  LOST: "background:color-mix(in srgb, var(--accent-red) 18%, transparent);color:var(--accent-red);border:1px solid var(--accent-red);",
+};
+function facilityStatusBadgeHtml(status, extraLabel) {
+  const style = FACILITY_STATUS_BADGE_STYLE[status] || FACILITY_STATUS_BADGE_STYLE.TARGET;
+  return `<span style="display:inline-block;font-size:9.5px;padding:2px 7px;border-radius:3px;letter-spacing:.05em;font-weight:700;${style}">${escapeHtml(extraLabel || FACILITY_STATUS_LABELS[status] || status)}</span>`;
+}
+function facilityCoordinateLabel(r) {
+  return `${r.coordinateX}:${r.coordinateY}`;
+}
+
+let facilityFilterType = "ALL";
+let facilityFilterStatus = "ALL";
+let facilitySortBy = "TYPE";
+const FACILITY_SORT_OPTIONS = [
+  { id: "TYPE", label: "Type" },
+  { id: "STATUS", label: "Status" },
+  { id: "PRIORITY", label: "Priority" },
+  { id: "COORDINATE", label: "Coordinate" },
+  { id: "PROTECTION", label: "Protection Ends" },
+];
+const FACILITY_PRIORITY_RANK = { HIGH: 0, NORMAL: 1, LOW: 2 };
+
+function facilitySortedFilteredRecords(records) {
+  let rows = records.slice();
+  if (facilityFilterType !== "ALL") rows = rows.filter((r) => r.type === facilityFilterType);
+  if (facilityFilterStatus !== "ALL") rows = rows.filter((r) => r.status === facilityFilterStatus);
+  rows.sort((a, b) => {
+    switch (facilitySortBy) {
+      case "STATUS":
+        return FACILITY_STATUSES.indexOf(a.status) - FACILITY_STATUSES.indexOf(b.status);
+      case "PRIORITY":
+        return (FACILITY_PRIORITY_RANK[a.priority] ?? 1) - (FACILITY_PRIORITY_RANK[b.priority] ?? 1);
+      case "COORDINATE":
+        return facilityCoordinateLabel(a).localeCompare(facilityCoordinateLabel(b), undefined, { numeric: true });
+      case "PROTECTION":
+        return (a.protectionEndsAt || Infinity) - (b.protectionEndsAt || Infinity);
+      case "TYPE":
+      default:
+        return FACILITY_ORDER.indexOf(a.type) - FACILITY_ORDER.indexOf(b.type) || a.level - b.level;
+    }
+  });
+  return rows;
+}
+
+function renderFacilityBuffSummaryHtml(records) {
+  const summary = computeFacilityBuffSummary(records);
+  const types = Object.keys(summary);
+  return `
+    <div class="panel" style="${accentPanelStyle("var(--console-magenta)")}">
+      ${accentPanelHeaderHtml("var(--console-magenta)", "⚡", "Active Facility Buff Summary")}
+      <p style="font-size:11.5px;color:var(--text-dim);margin-top:6px;">Auto-calculated from every facility currently marked OWNED — same type + different level stacks; same type + same level counts once.</p>
+      ${
+        types.length
+          ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;margin-top:10px;">
+              ${types
+                .map((type) => {
+                  const s = summary[type];
+                  const accent = FACILITY_TYPE_ACCENT[type];
+                  return `
+                <div style="background:var(--panel-2);border:1px solid ${accent};border-radius:6px;padding:10px 12px;">
+                  <div style="font-size:10px;letter-spacing:.1em;color:${accent};font-weight:700;">${FACILITY_DEFINITIONS[type].label.toUpperCase()}</div>
+                  <div style="font-size:20px;font-weight:800;color:#fff;font-variant-numeric:tabular-nums;margin:2px 0;">+${s.totalAmount}%</div>
+                  <div style="font-size:10.5px;color:var(--text-faint);">${escapeHtml(s.buffName)} · Lv ${s.levels.map((l) => l.level).join("+")}</div>
+                </div>`;
+                })
+                .join("")}
+            </div>`
+          : emptyStateHtml("bolt", "No active buffs yet.", "Mark a facility OWNED to see its buff here.", "var(--console-magenta)")
+      }
+    </div>
+  `;
+}
+
+function renderFacilitiesHtml(viewingAlliance, allianceMembers, canManage) {
+  const allRecords = allianceFacilityRecords(viewingAlliance);
+  const owned = allRecords.filter((r) => r.status === "OWNED");
+  const counts = {
+    owned: owned.length,
+    targets: allRecords.filter((r) => r.status === "TARGET").length,
+    contested: allRecords.filter((r) => r.status === "CONTESTED").length,
+    protected: owned.filter((r) => facilityIsProtected(r)).length,
+  };
+  const rows = facilitySortedFilteredRecords(allRecords);
+  return `
+    ${renderFacilityBuffSummaryHtml(allRecords)}
+
+    <div class="panel" style="${accentPanelStyle("var(--console-icecyan)")}">
+      ${accentPanelHeaderHtml("var(--console-icecyan)", "🏰", `Facility Ownership Tracker (${allRecords.length})`, canManage ? `<button class="btn small primary" id="facilityAdd">+ Add Facility</button>` : "")}
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:12px 0;">
+        <div style="background:var(--panel-2);border:1px solid var(--accent-green);border-radius:6px;padding:8px 10px;text-align:center;">
+          <div style="font-size:18px;font-weight:800;color:var(--accent-green);">${counts.owned}</div>
+          <div style="font-size:9.5px;letter-spacing:.08em;color:var(--text-faint);">OWNED</div>
+        </div>
+        <div style="background:var(--panel-2);border:1px solid var(--console-icecyan);border-radius:6px;padding:8px 10px;text-align:center;">
+          <div style="font-size:18px;font-weight:800;color:var(--console-icecyan);">${counts.targets}</div>
+          <div style="font-size:9.5px;letter-spacing:.08em;color:var(--text-faint);">TARGETS</div>
+        </div>
+        <div style="background:var(--panel-2);border:1px solid var(--accent-gold);border-radius:6px;padding:8px 10px;text-align:center;">
+          <div style="font-size:18px;font-weight:800;color:var(--accent-gold);">${counts.contested}</div>
+          <div style="font-size:9.5px;letter-spacing:.08em;color:var(--text-faint);">CONTESTED</div>
+        </div>
+        <div style="background:var(--panel-2);border:1px solid var(--accent-purple);border-radius:6px;padding:8px 10px;text-align:center;">
+          <div style="font-size:18px;font-weight:800;color:var(--accent-purple);">${counts.protected}</div>
+          <div style="font-size:9.5px;letter-spacing:.08em;color:var(--text-faint);">PROTECTED</div>
+        </div>
+      </div>
+
+      <div class="field-row" style="margin-bottom:10px;">
+        <div class="field" style="max-width:180px;">
+          <label>TYPE</label>
+          <select id="facilityFilterType">
+            <option value="ALL" ${facilityFilterType === "ALL" ? "selected" : ""}>All Types</option>
+            ${FACILITY_ORDER.map((t) => `<option value="${t}" ${facilityFilterType === t ? "selected" : ""}>${FACILITY_DEFINITIONS[t].label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field" style="max-width:160px;">
+          <label>STATUS</label>
+          <select id="facilityFilterStatus">
+            <option value="ALL" ${facilityFilterStatus === "ALL" ? "selected" : ""}>All Statuses</option>
+            ${FACILITY_STATUSES.map((s) => `<option value="${s}" ${facilityFilterStatus === s ? "selected" : ""}>${FACILITY_STATUS_LABELS[s]}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field" style="max-width:170px;">
+          <label>SORT BY</label>
+          <select id="facilitySortBy">
+            ${FACILITY_SORT_OPTIONS.map((o) => `<option value="${o.id}" ${facilitySortBy === o.id ? "selected" : ""}>${o.label}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+
+      ${
+        rows.length
+          ? `<div style="overflow-x:auto;">
+              <table>
+                <thead><tr><th>TYPE</th><th>LV</th><th>COORD</th><th>BUFF</th><th>STATUS</th><th>PRIORITY</th><th>PROTECTION ENDS (UTC)</th><th>ASSIGNED TO</th><th>NOTES</th>${canManage ? "<th></th>" : ""}</tr></thead>
+                <tbody>
+                  ${rows
+                    .map((r) => {
+                      const buff = facilityBuffInfo(r.type, r.level);
+                      const accent = FACILITY_TYPE_ACCENT[r.type];
+                      const protectedNow = facilityIsProtected(r);
+                      return `<tr>
+                        <td><span style="color:${accent};font-weight:700;">${FACILITY_DEFINITIONS[r.type].label}</span></td>
+                        <td style="font-variant-numeric:tabular-nums;">${r.level}</td>
+                        <td style="font-variant-numeric:tabular-nums;">${facilityCoordinateLabel(r)}</td>
+                        <td style="font-size:11.5px;">${buff ? `${escapeHtml(buff.buffName)} +${buff.buffAmount}%${buff.permanentLosses ? ` <span style="color:var(--accent-red);">⚠</span>` : ""}` : "—"}</td>
+                        <td>${facilityStatusBadgeHtml(r.status)}${protectedNow ? ` <span style="font-size:9px;color:var(--accent-purple);">🛡</span>` : ""}</td>
+                        <td style="text-transform:capitalize;">${(r.priority || "NORMAL").toLowerCase()}</td>
+                        <td style="font-size:11px;color:var(--text-dim);font-variant-numeric:tabular-nums;">${r.protectionEndsAt ? fmtUtcDateTime(r.protectionEndsAt) : "—"}</td>
+                        <td>${escapeHtml(r.assignedToName || "—")}</td>
+                        <td style="max-width:160px;font-size:11px;color:var(--text-dim);">${escapeHtml(r.notes || "—")}</td>
+                        ${
+                          canManage
+                            ? `<td style="white-space:nowrap;"><button data-facedit="${r.id}" class="btn small">Edit</button> <button data-facdel="${r.id}" class="btn small" style="color:var(--accent-red);">✕</button></td>`
+                            : ""
+                        }
+                      </tr>`;
+                    })
+                    .join("")}
+                </tbody>
+              </table>
+            </div>`
+          : emptyStateHtml("pin", "No facilities tracked yet.", canManage ? "Add one to start tracking your alliance's facilities." : "Check back once leadership adds one.", "var(--console-icecyan)")
+      }
+    </div>
+  `;
+}
+
+// Type→Level→Coordinate cascading Add/Edit modal — mirrors the openR4JobModal
+// pattern above. Buff/Buff Amount are ALWAYS derived (read-only, via
+// facilityBuffInfo) from whatever Type+Level is currently selected — never a
+// free-typed field — and the Coordinate <select> is repopulated from
+// facilityCoordinates(type, level) every time Type or Level changes, so an
+// invalid Type/Level/Coordinate combination can never be submitted.
+function openFacilityModal(viewingAlliance, members, existing, rerender) {
+  document.getElementById("facilityModalOverlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.id = "facilityModalOverlay";
+  overlay.className = "modal-overlay";
+
+  const initialType = existing?.type || FACILITY_ORDER[0];
+  const initialLevel = existing?.level || facilityTypeLevels(initialType)[0];
+  const initialCoord = existing ? facilityCoordinateLabel(existing) : "";
+
+  const levelOptionsHtml = (type, selectedLevel) =>
+    facilityTypeLevels(type)
+      .map((lvl) => `<option value="${lvl}" ${lvl === selectedLevel ? "selected" : ""}>Level ${lvl}</option>`)
+      .join("");
+  const coordOptionsHtml = (type, level, selectedCoord) => {
+    const coords = facilityCoordinates(type, level);
+    // If editing a record whose exact coordinate isn't in the list for
+    // whatever type/level is currently selected (only possible right after
+    // switching Type/Level in the form, before the user re-picks one), still
+    // show it so the field never silently shows a wrong selection.
+    const list = selectedCoord && !coords.includes(selectedCoord) ? [selectedCoord, ...coords] : coords;
+    return list.map((c) => `<option value="${c}" ${c === selectedCoord ? "selected" : ""}>${c}</option>`).join("");
+  };
+
+  overlay.innerHTML = `
+    <div class="modal">
+      <button class="close">&times;</button>
+      <h3>${existing ? "Edit Facility" : "Add Facility"}</h3>
+      <div class="field-row">
+        <div class="field">
+          <label>TYPE</label>
+          <select id="facmType">${FACILITY_ORDER.map((t) => `<option value="${t}" ${t === initialType ? "selected" : ""}>${FACILITY_DEFINITIONS[t].label}</option>`).join("")}</select>
+        </div>
+        <div class="field">
+          <label>LEVEL</label>
+          <select id="facmLevel">${levelOptionsHtml(initialType, initialLevel)}</select>
+        </div>
+      </div>
+      <div class="field">
+        <label>COORDINATE</label>
+        <select id="facmCoord">${coordOptionsHtml(initialType, initialLevel, initialCoord)}</select>
+      </div>
+      <div class="field" id="facmBuffField">
+        <label>BUFF (AUTO)</label>
+        <div id="facmBuffText" style="font-size:12.5px;color:var(--text-dim);padding:8px 0;"></div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>STATUS</label>
+          <select id="facmStatus">${FACILITY_STATUSES.map((s) => `<option value="${s}" ${(existing?.status || "TARGET") === s ? "selected" : ""}>${FACILITY_STATUS_LABELS[s]}</option>`).join("")}</select>
+        </div>
+        <div class="field">
+          <label>PRIORITY</label>
+          <select id="facmPriority">${FACILITY_PRIORITIES.map((p) => `<option value="${p}" ${(existing?.priority || "NORMAL") === p ? "selected" : ""}>${p.charAt(0) + p.slice(1).toLowerCase()}</option>`).join("")}</select>
+        </div>
+      </div>
+      <div id="facmCapNotice" style="font-size:11px;color:var(--text-faint);margin:-4px 0 4px;"></div>
+      <div class="field">
+        <label>ASSIGNED TO</label>
+        <select id="facmAssigned">
+          <option value="">Unassigned</option>
+          ${members.map((m) => `<option value="${m.id}" ${existing?.assignedTo === m.id ? "selected" : ""}>${escapeHtml(m.name)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>PROTECTION ENDS (UTC, OPTIONAL)</label>
+          <input id="facmProtection" type="datetime-local" value="${existing?.protectionEndsAt ? utcMsToDatetimeLocal(existing.protectionEndsAt) : ""}" />
+        </div>
+        <div class="field" style="flex:none;align-self:flex-end;">
+          <button type="button" class="btn small" id="facmAutoProtect">Capture now (+72h)</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>NOTES (OPTIONAL)</label>
+        <textarea id="facmNotes" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:9px 10px;font-size:13px;min-height:50px;resize:vertical;">${existing?.notes ? escapeHtml(existing.notes) : ""}</textarea>
+      </div>
+      <div id="facmErr" style="color:var(--accent-red);font-size:11.5px;margin:-2px 0 6px;min-height:16px;"></div>
+      <button class="btn primary" id="facmSave" style="width:100%;">${existing ? "SAVE CHANGES" : "ADD FACILITY"}</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.querySelector(".close").onclick = () => overlay.remove();
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+  const typeEl = overlay.querySelector("#facmType");
+  const levelEl = overlay.querySelector("#facmLevel");
+  const coordEl = overlay.querySelector("#facmCoord");
+  const statusEl = overlay.querySelector("#facmStatus");
+  const buffTextEl = overlay.querySelector("#facmBuffText");
+  const capNoticeEl = overlay.querySelector("#facmCapNotice");
+  const saveBtn = overlay.querySelector("#facmSave");
+
+  const refreshBuffText = () => {
+    const buff = facilityBuffInfo(typeEl.value, Number(levelEl.value));
+    buffTextEl.textContent = buff ? `${buff.buffName} +${buff.buffAmount}%${buff.permanentLosses ? " — WARNING: causes permanent troop losses on capture" : ""}` : "—";
+    buffTextEl.style.color = buff?.permanentLosses ? "var(--accent-red)" : "var(--text-dim)";
+  };
+  // Ownership-cap awareness (see FACILITY_MAX_ACTIVE in data.js): only
+  // applies when STATUS is set to OWNED — a TARGET/CONTESTED record of the
+  // same type is still trackable beyond the cap, it just can't be marked
+  // OWNED past it. When Status is OWNED, the Level dropdown is filtered down
+  // to levels that aren't already an OWNED slot for this type (the record's
+  // OWN current type+level, if any, is always kept available so re-saving
+  // it in place never locks you out of your own record). If NO level is
+  // available, Save is disabled and a "Maximum X facilities reached" notice
+  // is shown, per spec's UI BEHAVIOR section.
+  const refreshLevels = (keepLevel) => {
+    const type = typeEl.value;
+    const allLevels = facilityTypeLevels(type);
+    const wantOwned = statusEl.value === "OWNED";
+    const activeLevels = allianceActiveFacilityLevels(viewingAlliance, type, existing?.id);
+    const availableLevels = wantOwned ? allLevels.filter((lvl) => !activeLevels.includes(lvl)) : allLevels;
+    const level = availableLevels.includes(keepLevel) ? keepLevel : availableLevels[0] ?? allLevels[0];
+    levelEl.innerHTML = (availableLevels.length ? availableLevels : allLevels)
+      .map((lvl) => `<option value="${lvl}" ${lvl === level ? "selected" : ""}>Level ${lvl}</option>`)
+      .join("");
+    const maxed = wantOwned && !availableLevels.length;
+    levelEl.disabled = maxed;
+    if (maxed) {
+      capNoticeEl.textContent = `Maximum ${FACILITY_DEFINITIONS[type].label} facilities reached (${facilityMaxActiveForType(type)}/${facilityMaxActiveForType(type)} active) — free one up before marking another OWNED.`;
+      capNoticeEl.style.color = "var(--accent-red)";
+    } else if (wantOwned && activeLevels.length) {
+      capNoticeEl.textContent = `${FACILITY_DEFINITIONS[type].label}: ${activeLevels.length}/${facilityMaxActiveForType(type)} already active (Level ${activeLevels.join(", ")}).`;
+      capNoticeEl.style.color = "var(--text-faint)";
+    } else {
+      capNoticeEl.textContent = "";
+    }
+    saveBtn.disabled = maxed;
+    saveBtn.style.opacity = maxed ? "0.5" : "";
+    saveBtn.style.cursor = maxed ? "not-allowed" : "";
+  };
+  const refreshCoords = (keepCoord) => {
+    const coords = facilityCoordinates(typeEl.value, Number(levelEl.value));
+    const coord = coords.includes(keepCoord) ? keepCoord : coords[0];
+    coordEl.innerHTML = coordOptionsHtml(typeEl.value, Number(levelEl.value), coord);
+  };
+  refreshBuffText();
+  refreshLevels(initialLevel);
+
+  typeEl.addEventListener("change", () => { refreshLevels(); refreshCoords(); refreshBuffText(); });
+  levelEl.addEventListener("change", () => { refreshCoords(); refreshBuffText(); });
+  statusEl.addEventListener("change", () => { refreshLevels(Number(levelEl.value)); refreshCoords(coordEl.value); refreshBuffText(); });
+
+  overlay.querySelector("#facmAutoProtect").addEventListener("click", () => {
+    const input = overlay.querySelector("#facmProtection");
+    input.value = utcMsToDatetimeLocal(Date.now() + FACILITY_PROTECTION_MS);
+  });
+
+  overlay.querySelector("#facmSave").addEventListener("click", () => {
+    const errEl = overlay.querySelector("#facmErr");
+    const type = typeEl.value;
+    const level = Number(levelEl.value);
+    const coord = coordEl.value;
+    if (!FACILITY_ORDER.includes(type) || !isValidFacilityCombo(type, level, coord)) {
+      errEl.textContent = "Invalid Type / Level / Coordinate combination.";
+      return;
+    }
+    const [coordinateX, coordinateY] = coord.split(":").map(Number);
+    const status = FACILITY_STATUSES.includes(overlay.querySelector("#facmStatus").value) ? overlay.querySelector("#facmStatus").value : "TARGET";
+    // Ownership limit — enforced again here (not just via the disabled Level
+    // dropdown above) so it can never be bypassed, e.g. by a stale DOM state.
+    if (status === "OWNED" && !canAddActiveFacility(viewingAlliance, type, level, existing?.id)) {
+      errEl.textContent = `Maximum ${FACILITY_DEFINITIONS[type].label} facilities reached (max ${facilityMaxActiveForType(type)} active, levels must differ).`;
+      return;
+    }
+    if (facilityCoordinateInUse(viewingAlliance, coordinateX, coordinateY, existing?.id)) {
+      errEl.textContent = "Another active facility record already tracks this coordinate for this alliance.";
+      return;
+    }
+    const assignedTo = overlay.querySelector("#facmAssigned").value || null;
+    const assignedMember = members.find((m) => m.id === assignedTo);
+    const protectionInput = overlay.querySelector("#facmProtection").value;
+    const record = {
+      id: existing?.id || "fac" + Date.now(),
+      type,
+      level,
+      coordinateX,
+      coordinateY,
+      status,
+      priority: FACILITY_PRIORITIES.includes(overlay.querySelector("#facmPriority").value) ? overlay.querySelector("#facmPriority").value : "NORMAL",
+      assignedTo,
+      assignedToName: assignedMember ? assignedMember.name : "",
+      capturedAt: status === "OWNED" ? existing?.capturedAt || Date.now() : existing?.capturedAt || null,
+      protectionEndsAt: protectionInput ? datetimeLocalToUtcMs(protectionInput) : null,
+      notes: overlay.querySelector("#facmNotes").value.trim(),
+      createdAt: existing?.createdAt || Date.now(),
+      updatedAt: Date.now(),
+    };
+    upsertAllianceFacility(viewingAlliance, record);
+    overlay.remove();
+    rerender();
+  });
+}
+
+// datetime-local <input> works in the browser's LOCAL time zone, but every
+// other time field in this app is UTC (see fmtUtcDate/fmtUtcDateTime) — these
+// two helpers convert between that local-time input and a UTC epoch-ms
+// value so Protection Ends always stores/displays true UTC, never whatever
+// zone the browser happens to be in.
+function utcMsToDatetimeLocal(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+function datetimeLocalToUtcMs(value) {
+  if (!value) return null;
+  const [datePart, timePart] = value.split("T");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm] = (timePart || "00:00").split(":").map(Number);
+  return Date.UTC(y, m - 1, d, hh, mm);
+}
+// fmtUtcDateTime() already exists in data.js (24-hour UTC "YYYY-MM-DD HH:MM
+// UTC" formatter, used app-wide) — reused here rather than redefined.
+
+function wireFacilitiesSection(el, user, viewingAlliance, allianceMembers, canManage) {
+  el.querySelector("#facilityAdd")?.addEventListener("click", () => {
+    if (!canManage || !viewingAlliance) return;
+    openFacilityModal(viewingAlliance, allianceMembers, null, () => router());
+  });
+  el.querySelectorAll("[data-facedit]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      if (!canManage || !viewingAlliance) return;
+      const rec = allianceFacilityRecords(viewingAlliance).find((r) => r.id === btn.dataset.facedit);
+      if (!rec) return;
+      openFacilityModal(viewingAlliance, allianceMembers, rec, () => router());
+    })
+  );
+  el.querySelectorAll("[data-facdel]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      if (!canManage || !viewingAlliance) return;
+      if (!confirm("Delete this facility record? The buff summary will recalculate immediately.")) return;
+      deleteAllianceFacility(viewingAlliance, btn.dataset.facdel);
+      router();
+    })
+  );
+  el.querySelector("#facilityFilterType")?.addEventListener("change", (e) => { facilityFilterType = e.target.value; router(); });
+  el.querySelector("#facilityFilterStatus")?.addEventListener("change", (e) => { facilityFilterStatus = e.target.value; router(); });
+  el.querySelector("#facilitySortBy")?.addEventListener("change", (e) => { facilitySortBy = e.target.value; router(); });
 }
 
 const trackInputStyle = "background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:3px;padding:5px 8px;font-size:12px;";
