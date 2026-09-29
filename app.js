@@ -806,7 +806,7 @@ function pointsForMemberOnDay(memberId, day) {
 // Which schedule day (by its label) is which SvS day — Construction,
 // Research, and Troop Training all gate whether a member can produce
 // anything during their window on banked speedup minutes (General
-// wildcard minutes count too — see generalSpeedupSuggestion in data.js).
+// wildcard minutes count too — see generalSpeedupAllocation in data.js).
 function isConstructionDay(day) {
   return /construction/i.test(day || "");
 }
@@ -823,7 +823,8 @@ function isTroopDay(day) {
 // wildcard minutes standing in for them — to actually train/promote
 // anything during the window.
 function troopDayEligible(values) {
-  return Number(values?.sp_troop_train) > 0 || Number(values?.sp_general) > 0;
+  const alloc = generalSpeedupAllocation(values);
+  return Number(values?.sp_troop_train) > 0 || alloc.d3 > 0;
 }
 
 // Single dispatcher covering all three gated days, so slot-locking logic
@@ -1176,6 +1177,13 @@ const ADMIN_TABS = [
   { id: "schedule", label: "SCHEDULE / EVENTS", adminOnly: true },
   { id: "alliance-dash", label: "ALLIANCE DASHBOARD" },
   { id: "state", label: "STATE SETTINGS", adminOnly: true },
+  // "FACILITY PRIVACY / CLAIM VISIBILITY" round, spec section 12 — the one
+  // place a true ADMIN can see the complete, unmasked state-wide facility
+  // ownership picture (see renderFacilityOwnershipAdminHtml). adminOnly:
+  // true hides it from LEADER/R4 exactly like State Settings/Alliances —
+  // their own alliance's ownership is still fully visible on their own
+  // Alliance Dashboard → Facilities tab, just never another alliance's.
+  { id: "facility-ownership", label: "CURRENT OWNERSHIP", adminOnly: true },
   // NOT adminOnly — LEADER/R4 reach this tab too now, just read-only (see
   // renderNapDashboardBodyHtml dispatch below); only true ADMIN gets
   // renderNapAdminPanelHtml's edit controls.
@@ -1187,7 +1195,7 @@ let adminActiveTab = "members";
 // The tabs above that make up the "STATE DASHBOARD" umbrella section — see
 // STATE_DASHBOARD_SECTION below. Everything else (nap, alliance-dash) is
 // its own top-level section instead of nesting under State Dashboard.
-const STATE_DASHBOARD_TAB_IDS = ["members", "alliances", "svs", "schedule", "state", "feedback"];
+const STATE_DASHBOARD_TAB_IDS = ["members", "alliances", "svs", "schedule", "state", "feedback", "facility-ownership"];
 // Which of the three primary Admin sections (see the ADMIN page's own
 // restructure — State Dashboard / NAP Dashboard / Alliance Dashboard) a
 // true ADMIN is currently viewing. Only meaningful for true ADMIN — a
@@ -1544,10 +1552,14 @@ function luckyWheelCalcHtml(gems) {
 // Live status line under a "standout" speedup field (Construction,
 // Research, Troop) — these numbers are what actually gate that day's time
 // slot (dayEligible, above), so it's worth flagging right where they're
-// entered rather than only discovering it on TIME SLOTS. Also surfaces the
-// General-wildcard suggestion when it points at this day.
+// entered rather than only discovering it on TIME SLOTS. Also surfaces
+// however much General Speedup was allocated to this day (see the day
+// selection panel under SPEEDUPS / generalSpeedupAllocation in data.js).
 function dayStatusHtml(statusKey, values) {
-  const suggestion = generalSpeedupSuggestion(values);
+  const alloc = generalSpeedupAllocation(values);
+  const allocKey = statusKey === "construction" ? "d1" : statusKey === "research" ? "d2" : "d3";
+  const allocMins = alloc[allocKey] || 0;
+  const allocNote = allocMins ? ` (incl. ${fmtNum(allocMins)} allocated from General)` : "";
   // tone: "ok" (green, definitely eligible), "warn" (amber, "may be
   // eligible" — exactly one of two gates is maxed), or "closed" (red,
   // either 0 minutes banked or both gates maxed / no capacity at all).
@@ -1555,58 +1567,106 @@ function dayStatusHtml(statusKey, values) {
   if (statusKey === "construction") {
     const fullyMaxed = constructionFullyMaxed(values);
     const partiallyMaxed = constructionPartiallyMaxed(values);
-    const mins = Number(values?.d1_construction) || 0;
+    const mins = (Number(values?.d1_construction) || 0) + allocMins;
     if (fullyMaxed) {
       tone = "closed";
       primary = "Furnace at the state's current cap AND War Academy maxed — Construction speedups score 0 pts. Day 1 points now come only from Chief Charm.";
     } else if (partiallyMaxed) {
       tone = mins > 0 ? "warn" : "closed";
       primary = mins > 0
-        ? `${fmtNum(mins)} min banked — furnace cap or War Academy is maxed (not both), so this may be eligible for a Construction Day time slot.`
+        ? `${fmtNum(mins)} min banked${allocNote} — furnace cap or War Academy is maxed (not both), so this may be eligible for a Construction Day time slot.`
         : "Furnace cap or War Academy is maxed (not both) — bank Construction minutes and you may still be eligible for a Construction Day time slot.";
     } else {
       tone = mins > 0 ? "ok" : "closed";
       primary = mins > 0
-        ? `${fmtNum(mins)} min banked — eligible for a Construction Day time slot.`
+        ? `${fmtNum(mins)} min banked${allocNote} — eligible for a Construction Day time slot.`
         : "0 minutes — no real capacity to build on Construction Day, and no Construction Day time slot (see TIME SLOTS).";
     }
   } else if (statusKey === "research") {
     const fullyMaxed = researchFullyMaxed(values);
     const partiallyMaxed = researchPartiallyMaxed(values);
-    const mins = Number(values?.d2_research) || 0;
+    const mins = (Number(values?.d2_research) || 0) + allocMins;
     if (fullyMaxed) {
       tone = "closed";
       primary = "War Academy Research AND Tech Research both maxed — Research speedups score 0 pts here. Fire Crystal Shards, sigils, books, and hero shards still count.";
     } else if (partiallyMaxed) {
       tone = mins > 0 ? "warn" : "closed";
       primary = mins > 0
-        ? `${fmtNum(mins)} min banked — War Academy Research or Tech Research is maxed (not both), so this may be eligible for a Research Day time slot.`
+        ? `${fmtNum(mins)} min banked${allocNote} — War Academy Research or Tech Research is maxed (not both), so this may be eligible for a Research Day time slot.`
         : "War Academy Research or Tech Research is maxed (not both) — bank Research minutes and you may still be eligible for a Research Day time slot.";
     } else {
       tone = mins > 0 ? "ok" : "closed";
       primary = mins > 0
-        ? `${fmtNum(mins)} min banked — eligible for a Research Day time slot.`
+        ? `${fmtNum(mins)} min banked${allocNote} — eligible for a Research Day time slot.`
         : "0 minutes — no real capacity to research on Research Day, and no Research Day time slot (see TIME SLOTS).";
     }
   } else {
     const ok = troopDayEligible(values);
-    const mins = Number(values?.sp_troop_train) || 0;
+    const ownMins = Number(values?.sp_troop_train) || 0;
+    const mins = ownMins + allocMins;
     tone = ok ? "ok" : "closed";
     primary = ok
-      ? `${fmtNum(mins)} min banked${mins === 0 ? " (from General wildcard)" : ""} — eligible for a Troop Day time slot.`
+      ? `${fmtNum(mins)} min banked${ownMins === 0 && allocMins > 0 ? " (from General wildcard)" : allocNote} — eligible for a Troop Day time slot.`
       : "0 minutes — no real capacity to promote troops on Troop Day, and no Troop Day time slot (see TIME SLOTS).";
   }
-  const dayLabelForKey = { construction: "D1 — Construction", research: "D2 — Research", troop: "D4 — Troop" }[statusKey];
-  const sub = suggestion && suggestion.day === dayLabelForKey
-    ? `${suggestion.label} (${fmtNum(suggestion.mins)} mins of General speedups suggested to use)`
-    : "";
   const toneColor = tone === "ok" ? "var(--accent-green)" : tone === "warn" ? "var(--accent-amber)" : "var(--accent-red)";
   const toneBg = tone === "ok" ? "rgba(62,207,142,.1)" : tone === "warn" ? "rgba(255,176,32,.1)" : "rgba(255,84,112,.1)";
   return `
     <div class="rate" style="margin-top:6px;padding:8px 10px;border-radius:6px;background:${toneBg};border:1px solid ${toneColor};color:${toneColor};">
       ${primary}
     </div>
-    ${sub ? `<div class="rate" style="margin-top:4px;color:var(--accent-amber);">${sub}</div>` : ""}
+  `;
+}
+
+// General Speedup Day Selection panel — rendered under the SPEEDUPS
+// section's field grid. Lets a member spread their one shared General
+// Speedup pool (values.sp_general) across Day 1 — Construction, Day 2 —
+// Research, and Day 3 — Troop, either split evenly across whichever days
+// they check or entered exactly per day. All the actual math (even split,
+// manual clamping, remaining) lives in generalSpeedupAllocation in
+// data.js — this just renders that result and the controls that feed it.
+function generalSpeedupPanelHtml(values) {
+  const total = Number(values?.sp_general) || 0;
+  const alloc = generalSpeedupAllocation(values);
+  const dayMeta = [
+    { key: "d1", label: "Day 1 — Construction" },
+    { key: "d2", label: "Day 2 — Research" },
+    { key: "d3", label: "Day 3 — Troop" },
+  ];
+  const dayCheckboxHtml = (d) => `
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);cursor:pointer;">
+      <input type="checkbox" data-genday="${d.key}" ${values?.[`sp_general_use_${d.key}`] ? "checked" : ""} /> ${d.label}
+    </label>`;
+  const manualFieldHtml = (d) => {
+    const used = !!values?.[`sp_general_use_${d.key}`];
+    return `
+    <div class="field">
+      <label>${d.label}</label>
+      <div class="field-unit">
+        <input type="number" min="0" data-genalloc="${d.key}" value="${used ? Number(values?.[`sp_general_alloc_${d.key}`]) || 0 : 0}" ${used ? "" : "disabled"} placeholder="0" />
+        <span class="unit-suffix">min</span>
+      </div>
+    </div>`;
+  };
+  const evenResultHtml = (d) => `
+    <div class="field">
+      <label>${d.label}</label>
+      <div class="rate" style="font-size:13px;color:var(--text);">${fmtNum(alloc[d.key])} min</div>
+    </div>`;
+  return `
+    <div class="rate" style="margin:14px 0 6px;letter-spacing:.5px;font-size:10.5px;color:var(--text-faint);">USE GENERAL SPEEDUPS ON</div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px;">
+      ${dayMeta.map(dayCheckboxHtml).join("")}
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);margin-bottom:10px;cursor:pointer;">
+      <input type="checkbox" data-gensplit ${alloc.splitEven ? "checked" : ""} /> Split Evenly Across Selected Days
+    </label>
+    <div class="field-grid">
+      ${dayMeta.map(alloc.splitEven ? evenResultHtml : manualFieldHtml).join("")}
+    </div>
+    ${alloc.noneSelected ? `<div class="rate" style="margin-top:8px;color:var(--accent-red);">Select at least one day to allocate your ${fmtNum(total)} min of General Speedups.</div>` : ""}
+    ${alloc.overAllocated ? `<div class="rate" style="margin-top:8px;color:var(--accent-red);">Allocated minutes exceed your total General Speedups — reduce one or more days below.</div>` : ""}
+    <div class="rate" style="margin-top:8px;color:${alloc.remaining < 0 ? "var(--accent-red)" : "var(--text-dim)"};">Remaining General Speedups: ${fmtNum(alloc.remaining)} min</div>
   `;
 }
 
@@ -1617,7 +1677,7 @@ function renderWizardBackpack(el, wrap) {
       <div class="section-title">${section.title}</div>
       ${
         section.title === "SPEEDUPS"
-          ? `<p style="font-size:11.5px;color:var(--text-dim);margin:-4px 0 12px;">Enter what you have banked — Construction, Research, and Troop auto-fill into their matching day below. <strong style="color:var(--text);">General</strong> is a wildcard: it can stand in for any of the three, spent wherever the opportunity is best.</p>`
+          ? `<p style="font-size:11.5px;color:var(--text-dim);margin:-4px 0 12px;">Enter what you have banked — Construction, Research, and Troop auto-fill into their matching day below. <strong style="color:var(--text);">General</strong> is a wildcard: allocate it across Day 1/2/3 below and it scores through whichever day(s) you assign it to.</p>`
           : ""
       }
       ${
@@ -1664,7 +1724,8 @@ function renderWizardBackpack(el, wrap) {
             </div>`;
           })
           .join("")}
-      </div>`
+      </div>
+      ${section.title === "SPEEDUPS" ? generalSpeedupPanelHtml(svsDraft.values) : ""}`
     ).join("")}
     <button class="btn primary" id="wizNext" style="margin-top:6px;">NEXT → REVIEW POINTS</button>
   `;
@@ -1703,6 +1764,32 @@ function renderWizardBackpack(el, wrap) {
     input.addEventListener("change", () => {
       commitLocal();
       if (field?.syncTo) svsDraft.values[field.syncTo] = svsDraft.values[input.dataset.field];
+      renderWizardBackpack(el, wrap);
+    });
+  });
+  el.querySelectorAll("[data-genday]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      svsDraft.values[`sp_general_use_${cb.dataset.genday}`] = cb.checked;
+      scheduleDraftAutosave();
+      renderWizardBackpack(el, wrap);
+    });
+  });
+  const genSplitCb = el.querySelector("[data-gensplit]");
+  if (genSplitCb) {
+    genSplitCb.addEventListener("change", () => {
+      svsDraft.values.sp_general_split_even = genSplitCb.checked;
+      scheduleDraftAutosave();
+      renderWizardBackpack(el, wrap);
+    });
+  }
+  el.querySelectorAll("[data-genalloc]").forEach((input) => {
+    const commitGenAlloc = () => {
+      svsDraft.values[`sp_general_alloc_${input.dataset.genalloc}`] = Number(input.value) || 0;
+      scheduleDraftAutosave();
+    };
+    input.addEventListener("input", commitGenAlloc);
+    input.addEventListener("change", () => {
+      commitGenAlloc();
       renderWizardBackpack(el, wrap);
     });
   });
@@ -3676,6 +3763,8 @@ function renderAdmin(el) {
 
     ${adminActiveTab !== "svs" ? "" : renderSvsSignupAdminPanelHtml(user, officerScoped)}
 
+    ${adminActiveTab !== "facility-ownership" || officerScoped ? "" : renderFacilityOwnershipAdminHtml()}
+
     ${adminActiveTab !== "alliance-dash" ? "" : renderAllianceDashboardTabHtml(user, officerScoped)}
 
     ${
@@ -4036,6 +4125,7 @@ function renderAdmin(el) {
   wireSvsSignupAdminPanel(el, user, officerScoped);
   wireAllianceDashboardTab(el, user, officerScoped);
   if (!officerScoped) wireNapAdminPanel(el, user);
+  if (!officerScoped) wireFacilityOwnershipAdmin(el, user);
 }
 
 // ---------------------------------------------------------------------------
@@ -5905,10 +5995,18 @@ function openFacilityModal(viewingAlliance, members, existing, rerender, user) {
   // coordinates are never filtered out of this list — leadership still
   // needs to see/select them for shared facilities, rotating facilities,
   // planning targets, or correcting another alliance's bad record — they're
-  // just clearly labeled with who holds them. The ownership text is purely
-  // DISPLAY DATA computed fresh from the existing per-alliance records each
-  // time this renders; nothing about it is ever stored on the coordinate
-  // itself (the record's own coordinateX/coordinateY stay a plain "x:y").
+  // just clearly labeled with who holds them (subject to the privacy mask
+  // below). The ownership text is purely DISPLAY DATA computed fresh from
+  // the existing per-alliance records each time this renders; nothing about
+  // it is ever stored on the coordinate itself (the record's own
+  // coordinateX/coordinateY stay a plain "x:y").
+  //
+  // "FACILITY PRIVACY / CLAIM VISIBILITY" round — every option's ownership
+  // is routed through facilityOwnerVisibility() before it's ever turned into
+  // text or a color: a true ADMIN (isTrueAdmin) still sees the real owner
+  // and Sharing/Rotation detail exactly as before; everyone else sees only
+  // CLAIMED / UNCLAIMED / CONTESTED, or "Your Alliance" for their own
+  // alliance's own record — never another alliance's name.
   const coordOptionsHtml = (type, level, selectedCoord) => {
     const coords = facilityCoordinates(type, level);
     // If editing a record whose exact coordinate isn't in the list for
@@ -5920,18 +6018,29 @@ function openFacilityModal(viewingAlliance, members, existing, rerender, user) {
     return list
       .map((c) => {
         const [cx, cy] = c.split(":").map(Number);
-        const info = stateFacilityOwnerInfo(type, level, cx, cy, ownerMap);
-        const label = stateFacilityOwnerLabel(info);
+        const rawInfo = stateFacilityOwnerInfo(type, level, cx, cy, ownerMap);
+        const vis = facilityOwnerVisibility(rawInfo, viewingAlliance, isTrueAdmin);
+        const label = facilityOwnerVisibleLabel(vis);
         // Status-based text tint — a plain <option> can't render a real
         // multi-badge like the table does, so this is a single color per
-        // option standing in for the badge legend (green=owned, gray=
-        // unclaimed, orange=contested/unknown, purple=shared, cyan=
+        // option standing in for the badge legend (green=owned/claimed,
+        // gray=unclaimed, orange=contested/unknown, purple=shared, cyan=
         // rotating-only); sharing wins over rotating when a record is both,
-        // since the label text already spells out "Shared/Rotating" either way.
+        // since the label text already spells out "Shared/Rotating" either
+        // way. PUBLIC/OWN visibility only ever gets the plain green/gray/
+        // amber tone — sharing/rotating tints are ADMIN-only, since those
+        // colors would themselves hint at facts a masked viewer can't see.
         let color = "var(--text-faint)";
-        if (info.status === "OWNED") {
-          color = info.record.sharingEnabled ? "var(--accent-purple)" : info.record.rotating ? "var(--console-icecyan)" : "var(--accent-green)";
-        } else if (info.status === "CONTESTED" || info.status === "UNKNOWN") {
+        if (vis.status === "OWNED" || vis.status === "CLAIMED") {
+          color =
+            vis.visibility === "ADMIN"
+              ? vis.record.sharingEnabled
+                ? "var(--accent-purple)"
+                : vis.record.rotating
+                ? "var(--console-icecyan)"
+                : "var(--accent-green)"
+              : "var(--accent-green)";
+        } else if (vis.status === "CONTESTED" || vis.status === "UNKNOWN") {
           color = "var(--accent-amber)";
         }
         return `<option value="${c}" style="color:${color};" ${c === selectedCoord ? "selected" : ""}>${c} — ${escapeHtml(label)}</option>`;
@@ -6121,25 +6230,38 @@ function openFacilityModal(viewingAlliance, members, existing, rerender, user) {
   // coordinate another alliance already has OWNED is explicitly allowed
   // (shared/rotating/being-transferred/being-corrected facilities all need
   // this) — this only ever informs, it never blocks Save.
+  //
+  // "FACILITY PRIVACY / CLAIM VISIBILITY" round — routed through
+  // facilityOwnerVisibility() exactly like coordOptionsHtml above: a
+  // masked (PUBLIC) result never gets an "info.alliance" put in front of
+  // it, in this panel OR in the warning text below it.
   const refreshCoordInfo = () => {
     const type = typeEl.value;
     const level = Number(levelEl.value);
     const coord = coordEl.value;
     if (!coord) { coordInfoEl.innerHTML = ""; coordWarningEl.style.display = "none"; return; }
     const [cx, cy] = coord.split(":").map(Number);
-    const info = stateFacilityOwnerInfo(type, level, cx, cy);
+    const rawInfo = stateFacilityOwnerInfo(type, level, cx, cy);
+    const vis = facilityOwnerVisibility(rawInfo, viewingAlliance, isTrueAdmin);
     // FACILITY_STATUS_LABELS (data.js) only covers a saved record's own
-    // TARGET/CONTESTED/OWNED/LOST status; UNCLAIMED/UNKNOWN are synthetic,
-    // state-wide-lookup-only outcomes with no stored record behind them, so
-    // they get their own display labels here rather than in data.js.
-    const STATE_OWNER_STATUS_LABELS = { UNCLAIMED: "Unclaimed", CONTESTED: "Contested", UNKNOWN: "Owner Unknown" };
-    const ownerText = info.status === "OWNED" ? escapeHtml(info.alliance) : STATE_OWNER_STATUS_LABELS[info.status];
+    // TARGET/CONTESTED/OWNED/LOST status; UNCLAIMED/CONTESTED(public)/
+    // UNKNOWN are synthetic, state-wide-lookup-only outcomes with no
+    // stored record behind them (or one this viewer can't see), so they
+    // get their own display labels here rather than in data.js.
+    const STATE_OWNER_STATUS_LABELS = { UNCLAIMED: "Unclaimed", CONTESTED: "Contested", UNKNOWN: "Owner Unknown", CLAIMED: "Claimed" };
+    const isVisibleOwned = vis.status === "OWNED"; // true only for ADMIN or the viewer's OWN alliance
+    const ownerText = isVisibleOwned ? escapeHtml(vis.visibility === "OWN" ? "Your Alliance" : vis.alliance) : STATE_OWNER_STATUS_LABELS[vis.status];
     const lines = [
       `<div><b style="color:var(--text);">Current Owner:</b> ${ownerText}</div>`,
-      `<div><b style="color:var(--text);">Status:</b> ${info.status === "OWNED" ? FACILITY_STATUS_LABELS[info.record.status] || info.record.status : STATE_OWNER_STATUS_LABELS[info.status]}</div>`,
+      `<div><b style="color:var(--text);">Status:</b> ${isVisibleOwned ? FACILITY_STATUS_LABELS[vis.record.status] || vis.record.status : STATE_OWNER_STATUS_LABELS[vis.status]}</div>`,
     ];
-    if (info.status === "OWNED") {
-      const r = info.record;
+    // Sharing/Rotation detail is only ever shown when this viewer is
+    // allowed to see it at all (ADMIN, or it's their own alliance's
+    // record) — a masked CLAIMED result never gets these two lines, per
+    // spec sections 8/9 ("Do not expose Shared With/rotation partner
+    // names to unrelated alliances").
+    if (isVisibleOwned) {
+      const r = vis.record;
       lines.push(`<div><b style="color:var(--text);">Sharing:</b> ${r.sharingEnabled ? escapeHtml(r.sharedWithAlliance || "—") : "Not Shared"}</div>`);
       lines.push(
         `<div><b style="color:var(--text);">Rotation:</b> ${
@@ -6148,8 +6270,11 @@ function openFacilityModal(viewingAlliance, members, existing, rerender, user) {
       );
     }
     coordInfoEl.innerHTML = lines.join("");
-    if (info.status === "OWNED" && info.alliance !== viewingAlliance) {
-      coordWarningEl.textContent = `This facility is currently recorded as owned by ${info.alliance}.`;
+    if (rawInfo.status === "OWNED" && rawInfo.alliance !== viewingAlliance) {
+      coordWarningEl.textContent =
+        vis.visibility === "ADMIN"
+          ? `This facility is currently recorded as owned by ${rawInfo.alliance}.`
+          : "This facility is currently recorded as CLAIMED by another alliance.";
       coordWarningEl.style.display = "";
     } else {
       coordWarningEl.textContent = "";
@@ -6286,8 +6411,17 @@ function openFacilityModal(viewingAlliance, members, existing, rerender, user) {
     if (!transferConfirmed && status === "OWNED") {
       const conflictInfo = stateFacilityOwnerInfo(type, level, coordinateX, coordinateY);
       if (conflictInfo.status === "OWNED" && conflictInfo.alliance !== viewingAlliance) {
+        // pendingTransfer always carries the REAL previous owner — that's
+        // needed internally to flip the correct record to LOST and log an
+        // accurate audit entry (applyFacilityOwnershipTransfer below), and
+        // is never itself rendered to a non-admin viewer. Only the MESSAGE
+        // text is masked (spec: don't expose the owning alliance's name to
+        // a non-admin, even here) — a non-admin still needs to know a
+        // conflict exists in order to decide whether to proceed at all.
         pendingTransfer = { type, level, coordinateX, coordinateY, previousOwner: conflictInfo.alliance };
-        transferMsgEl.textContent = `This facility is currently recorded as owned by ${conflictInfo.alliance}. Cancel to leave it as-is, or transfer it to ${viewingAlliance} — this marks ${conflictInfo.alliance}'s record LOST and logs the change.`;
+        transferMsgEl.textContent = isTrueAdmin
+          ? `This facility is currently recorded as owned by ${conflictInfo.alliance}. Cancel to leave it as-is, or transfer it to ${viewingAlliance} — this marks ${conflictInfo.alliance}'s record LOST and logs the change.`
+          : `This facility is currently recorded as CLAIMED by another alliance. Cancel to leave it as-is, or record it as owned by ${viewingAlliance} instead — this marks the other alliance's record LOST and logs the change.`;
         transferConfirmEl.style.display = "";
         return;
       }
@@ -6397,6 +6531,234 @@ function wireFacilitiesSection(el, user, viewingAlliance, allianceMembers, canMa
   el.querySelector("#facilityFilterType")?.addEventListener("change", (e) => { facilityFilterType = e.target.value; router(); });
   el.querySelector("#facilityFilterStatus")?.addEventListener("change", (e) => { facilityFilterStatus = e.target.value; router(); });
   el.querySelector("#facilitySortBy")?.addEventListener("change", (e) => { facilitySortBy = e.target.value; router(); });
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN-ONLY "STATE DASHBOARD → FACILITIES → CURRENT OWNERSHIP" page (spec
+// section 12, "FACILITY PRIVACY / CLAIM VISIBILITY" round). This is the one
+// place in the app that's allowed to show the complete, unmasked, state-wide
+// facility ownership picture in one list — gated to true ADMIN only by
+// being nested under adminSection === "state" (see ADMIN_TABS/STATE_DASHBOARD_TAB_IDS
+// below), the same admin-only tier as State Settings. Every row comes from
+// allStateFacilitySlots() (data.js) — the fixed game reference data crossed
+// with the SAME live per-alliance records every other facility view reads;
+// nothing here is a second stored ownership table.
+// ---------------------------------------------------------------------------
+let facOwnFilterAlliance = "ALL";
+let facOwnFilterType = "ALL";
+let facOwnFilterLevel = "ALL";
+let facOwnFilterStatus = "ALL";
+let facOwnSearchCoord = "";
+let facOwnHistoryFilterCoord = null; // {type, level, coordinateX, coordinateY} or null (show all history)
+
+const FAC_OWN_STATUS_BADGE_STYLE = {
+  ...FACILITY_STATUS_BADGE_STYLE,
+  UNCLAIMED: "background:color-mix(in srgb, var(--text-faint) 18%, transparent);color:var(--text-faint);border:1px solid var(--text-faint);",
+  UNKNOWN: "background:color-mix(in srgb, var(--accent-amber) 18%, transparent);color:var(--accent-amber);border:1px solid var(--accent-amber);",
+};
+function facOwnStatusBadgeHtml(status, label) {
+  const style = FAC_OWN_STATUS_BADGE_STYLE[status] || FAC_OWN_STATUS_BADGE_STYLE.TARGET;
+  return `<span style="display:inline-block;font-size:9.5px;padding:2px 7px;border-radius:3px;letter-spacing:.05em;font-weight:700;${style}">${escapeHtml(label)}</span>`;
+}
+
+function renderFacilityOwnershipAdminHtml() {
+  const allLevels = Array.from(new Set(FACILITY_ORDER.flatMap((t) => facilityTypeLevels(t)))).sort((a, b) => a - b);
+  const slots = allStateFacilitySlots().filter((s) => {
+    if (facOwnFilterType !== "ALL" && s.type !== facOwnFilterType) return false;
+    if (facOwnFilterLevel !== "ALL" && s.level !== Number(facOwnFilterLevel)) return false;
+    if (facOwnFilterAlliance !== "ALL" && !(s.info.status === "OWNED" && s.info.alliance === facOwnFilterAlliance)) return false;
+    if (facOwnFilterStatus !== "ALL" && s.info.status !== facOwnFilterStatus) return false;
+    if (facOwnSearchCoord.trim() && !s.coord.includes(facOwnSearchCoord.trim())) return false;
+    return true;
+  });
+  const historyAll = Store.facilityOwnershipTransfers.slice().sort((a, b) => b.changedAt - a.changedAt);
+  const history = facOwnHistoryFilterCoord
+    ? historyAll.filter(
+        (h) =>
+          h.type === facOwnHistoryFilterCoord.type &&
+          h.level === facOwnHistoryFilterCoord.level &&
+          h.coordinateX === facOwnHistoryFilterCoord.coordinateX &&
+          h.coordinateY === facOwnHistoryFilterCoord.coordinateY
+      )
+    : historyAll;
+
+  return `
+    <div class="panel" style="${accentPanelStyle("var(--console-magenta)")}">
+      ${accentPanelHeaderHtml("var(--console-magenta)", "🔑", "Current Ownership")}
+      <p style="font-size:11.5px;color:var(--text-dim);margin-top:6px;">
+        Complete state-wide facility ownership — ADMIN ONLY. Every other view in this app (Alliance Dashboard's own Facilities tab, the coordinate dropdown) masks another alliance's identity down to CLAIMED/UNCLAIMED/CONTESTED; this page is the one place that shows the real owner, sharing partner and rotation partner for every physical facility in the state.
+      </p>
+      <div class="field-row" style="margin-top:12px;margin-bottom:10px;">
+        <div class="field">
+          <label>ALLIANCE</label>
+          <select id="facOwnFilterAlliance">
+            <option value="ALL" ${facOwnFilterAlliance === "ALL" ? "selected" : ""}>All Alliances</option>
+            ${Store.alliances.map((a) => `<option value="${escapeHtml(a)}" ${facOwnFilterAlliance === a ? "selected" : ""}>${escapeHtml(a)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>TYPE</label>
+          <select id="facOwnFilterType">
+            <option value="ALL" ${facOwnFilterType === "ALL" ? "selected" : ""}>All Types</option>
+            ${FACILITY_ORDER.map((t) => `<option value="${t}" ${facOwnFilterType === t ? "selected" : ""}>${FACILITY_DEFINITIONS[t].label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>LEVEL</label>
+          <select id="facOwnFilterLevel">
+            <option value="ALL" ${facOwnFilterLevel === "ALL" ? "selected" : ""}>All Levels</option>
+            ${allLevels.map((l) => `<option value="${l}" ${facOwnFilterLevel === String(l) ? "selected" : ""}>Level ${l}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>STATUS</label>
+          <select id="facOwnFilterStatus">
+            <option value="ALL" ${facOwnFilterStatus === "ALL" ? "selected" : ""}>All Statuses</option>
+            <option value="OWNED" ${facOwnFilterStatus === "OWNED" ? "selected" : ""}>Owned</option>
+            <option value="UNCLAIMED" ${facOwnFilterStatus === "UNCLAIMED" ? "selected" : ""}>Unclaimed</option>
+            <option value="CONTESTED" ${facOwnFilterStatus === "CONTESTED" ? "selected" : ""}>Contested</option>
+            <option value="UNKNOWN" ${facOwnFilterStatus === "UNKNOWN" ? "selected" : ""}>Owner Unknown</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>SEARCH COORDINATE</label>
+          <input id="facOwnSearchCoord" placeholder="e.g. 138:" value="${escapeHtml(facOwnSearchCoord)}" />
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>FACILITY</th><th>LEVEL</th><th>COORD</th><th>BUFF</th><th>CURRENT OWNER</th><th>STATUS</th>
+              <th>SHARED WITH</th><th>ROTATION</th><th>PROTECTION ENDS</th><th>NOTES</th><th>ASSIGN TO</th><th>ACTIONS</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              slots.length
+                ? slots
+                    .map((s) => {
+                      const buff = facilityBuffInfo(s.type, s.level);
+                      const info = s.info;
+                      const isOwned = info.status === "OWNED";
+                      const r = isOwned ? info.record : null;
+                      return `
+                <tr>
+                  <td>${FACILITY_DEFINITIONS[s.type].label}</td>
+                  <td>Lv${s.level}</td>
+                  <td style="font-variant-numeric:tabular-nums;">${s.coord}</td>
+                  <td style="font-size:11px;color:var(--text-dim);">${buff ? `${buff.buffName} +${buff.buffAmount}%` : "—"}</td>
+                  <td>${isOwned ? escapeHtml(info.alliance) : "—"}</td>
+                  <td>${
+                    isOwned
+                      ? facilityStatusBadgeHtml(r.status)
+                      : facOwnStatusBadgeHtml(info.status, info.status === "UNKNOWN" ? "Owner Unknown" : info.status.charAt(0) + info.status.slice(1).toLowerCase())
+                  }</td>
+                  <td style="font-size:11px;">${isOwned && r.sharingEnabled ? escapeHtml(r.sharedWithAlliance || "—") : "—"}</td>
+                  <td style="font-size:11px;">${isOwned && r.rotating ? `${escapeHtml(r.rotationAlliance || "—")} (next: ${escapeHtml(r.nextRotationOwnerAlliance || "—")})` : "—"}</td>
+                  <td style="font-size:11px;color:var(--text-dim);">${isOwned && r.protectionEndsAt ? facilityCountdownText(r.protectionEndsAt) : "—"}</td>
+                  <td style="font-size:11px;color:var(--text-dim);max-width:160px;overflow-wrap:anywhere;">${isOwned && r.notes ? escapeHtml(r.notes) : "—"}</td>
+                  <td>
+                    <select data-facownassignsel="${s.coord}|${s.type}|${s.level}" style="min-width:0;padding:4px 6px;font-size:11px;">
+                      ${Store.alliances.map((a) => `<option value="${escapeHtml(a)}" ${a === (isOwned ? info.alliance : Store.alliances[0]) ? "selected" : ""}>${escapeHtml(a)}</option>`).join("")}
+                    </select>
+                  </td>
+                  <td style="white-space:nowrap;">
+                    <button class="btn small" data-facownedit="${s.coord}|${s.type}|${s.level}">${isOwned ? "Edit" : "Add"}</button>
+                    ${isOwned ? `<button class="btn small" data-facowntransfer="${s.coord}|${s.type}|${s.level}">Transfer</button>` : ""}
+                    <button class="btn small" data-facownhistory="${s.coord}|${s.type}|${s.level}">History</button>
+                  </td>
+                </tr>`;
+                    })
+                    .join("")
+                : `<tr><td colspan="12">${emptyStateHtml("search", "No facilities match these filters.", "Try a different alliance, type, level, status, or coordinate search.", "var(--console-magenta)")}</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" style="${accentPanelStyle("var(--console-magenta)")}">
+      ${accentPanelHeaderHtml(
+        "var(--console-magenta)",
+        "📜",
+        `Ownership History${facOwnHistoryFilterCoord ? ` — ${facOwnHistoryFilterCoord.coord}` : ""}`,
+        facOwnHistoryFilterCoord ? `<button class="btn small" id="facOwnHistoryClear">Show All</button>` : ""
+      )}
+      <p style="font-size:11.5px;color:var(--text-dim);margin-top:6px;">Append-only audit log of every TRANSFER TO action (from either this page or the Add/Edit Facility modal's Cancel/Transfer prompt) — never itself read as "who owns this now" (that's always the live table above).</p>
+      <div style="overflow-x:auto;margin-top:10px;">
+        <table>
+          <thead><tr><th>WHEN (UTC)</th><th>FACILITY</th><th>COORD</th><th>PREVIOUS OWNER</th><th>NEW OWNER</th><th>CHANGED BY</th></tr></thead>
+          <tbody>
+            ${
+              history.length
+                ? history
+                    .map(
+                      (h) => `
+              <tr>
+                <td style="font-size:11px;color:var(--text-dim);">${fmtUtcDateTime(h.changedAt)}</td>
+                <td>${FACILITY_DEFINITIONS[h.type]?.label || h.type} Lv${h.level}</td>
+                <td style="font-variant-numeric:tabular-nums;">${h.coordinateX}:${h.coordinateY}</td>
+                <td>${escapeHtml(h.previousOwner)}</td>
+                <td>${escapeHtml(h.newOwner)}</td>
+                <td>${escapeHtml(h.changedBy)}</td>
+              </tr>`
+                    )
+                    .join("")
+                : `<tr><td colspan="6">${emptyStateHtml("clock", "No ownership transfers recorded yet.", "", "var(--console-magenta)")}</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function wireFacilityOwnershipAdmin(el, user) {
+  el.querySelector("#facOwnFilterAlliance")?.addEventListener("change", (e) => { facOwnFilterAlliance = e.target.value; router(); });
+  el.querySelector("#facOwnFilterType")?.addEventListener("change", (e) => { facOwnFilterType = e.target.value; router(); });
+  el.querySelector("#facOwnFilterLevel")?.addEventListener("change", (e) => { facOwnFilterLevel = e.target.value; router(); });
+  el.querySelector("#facOwnFilterStatus")?.addEventListener("change", (e) => { facOwnFilterStatus = e.target.value; router(); });
+  el.querySelector("#facOwnSearchCoord")?.addEventListener("input", (e) => { facOwnSearchCoord = e.target.value; router(); });
+  el.querySelector("#facOwnHistoryClear")?.addEventListener("click", () => { facOwnHistoryFilterCoord = null; router(); });
+
+  const parseKey = (key) => {
+    const [coord, type, levelStr] = key.split("|");
+    const [coordinateX, coordinateY] = coord.split(":").map(Number);
+    return { coord, type, level: Number(levelStr), coordinateX, coordinateY };
+  };
+  const assignedAllianceFor = (key) => el.querySelector(`[data-facownassignsel="${key}"]`)?.value || Store.alliances[0];
+
+  el.querySelectorAll("[data-facownedit]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.facownedit;
+      const { type, level, coordinateX, coordinateY } = parseKey(key);
+      const rawInfo = stateFacilityOwnerInfo(type, level, coordinateX, coordinateY);
+      const targetAlliance = rawInfo.status === "OWNED" ? rawInfo.alliance : assignedAllianceFor(key);
+      const existingRecord = rawInfo.status === "OWNED" ? rawInfo.record : null;
+      const members = Store.members.filter((m) => m.alliance === targetAlliance);
+      openFacilityModal(targetAlliance, members, existingRecord, () => router(), user);
+    })
+  );
+  el.querySelectorAll("[data-facowntransfer]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.facowntransfer;
+      const { type, level, coordinateX, coordinateY } = parseKey(key);
+      const rawInfo = stateFacilityOwnerInfo(type, level, coordinateX, coordinateY);
+      if (rawInfo.status !== "OWNED") return;
+      const newOwner = assignedAllianceFor(key);
+      if (!newOwner || newOwner === rawInfo.alliance) return;
+      if (!confirm(`Transfer this facility from ${rawInfo.alliance} to ${newOwner}? ${rawInfo.alliance}'s record will be marked LOST and the change logged.`)) return;
+      quickTransferFacilityOwnership(rawInfo.record, rawInfo.alliance, newOwner, user?.name);
+      router();
+    })
+  );
+  el.querySelectorAll("[data-facownhistory]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const { type, level, coordinateX, coordinateY, coord } = parseKey(btn.dataset.facownhistory);
+      facOwnHistoryFilterCoord = { type, level, coordinateX, coordinateY, coord };
+      router();
+    })
+  );
 }
 
 const trackInputStyle = "background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:3px;padding:5px 8px;font-size:12px;";
