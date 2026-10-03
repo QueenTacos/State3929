@@ -2336,11 +2336,28 @@ function timeSelectOptionsHtml(selected) {
   return opts.join("");
 }
 
-function countSelectedSlots() {
-  if (svsDraft.availabilityType === "all") return { n: svsDraft.slots.all.filter(Boolean).length, denom: 48 };
+// Counts an svsDraft-shaped submission's selected time slots — `sub`
+// defaults to the in-progress svsDraft (every existing caller, unchanged),
+// but also accepts any saved bag submission object (same shape, since a
+// submission IS svsDraft at the moment it's saved — see doSave() above) so
+// the same single counting rule can be reused by the Participation table's
+// BAG status (§ UPDATE PARTICIPATION STATUS LOGIC — "use the selected
+// time-slot count as the source of truth", never a record's mere existence,
+// points, inventory, or whether the page was opened).
+function countSelectedSlots(sub) {
+  sub = sub || svsDraft;
+  if (sub.availabilityType === "all") return { n: (sub.slots?.all || []).filter(Boolean).length, denom: 48 };
   let n = 0;
-  SEED_SCHEDULE_DAYS.forEach((d) => (n += (svsDraft.slots.byDay[d] || []).filter(Boolean).length));
+  SEED_SCHEDULE_DAYS.forEach((d) => (n += (sub.slots?.byDay?.[d] || []).filter(Boolean).length));
   return { n, denom: 48 * SEED_SCHEDULE_DAYS.length };
+}
+
+// A bag submission counts as SUBMITTED only once 4+ time slots are
+// selected — a saved record with fewer than 4 (including a record with 0,
+// e.g. saved before any slot was tapped) is MISSING, never SUBMITTED.
+const BAG_SUBMITTED_MIN_SLOTS = 4;
+function bagSubmissionIsComplete(sub) {
+  return !!sub && countSelectedSlots(sub).n >= BAG_SUBMITTED_MIN_SLOTS;
 }
 
 function bestBuffDay() {
@@ -5582,8 +5599,23 @@ function renderAllianceDashEventTimesHtml(viewingAlliance, canManage) {
 }
 
 function renderAllianceDashParticipationHtml(viewingAlliance, members, bagSubs, svsSignups, canManage) {
+  // BAG and TIME SLOT are two SEPARATE statuses (§ UPDATE PARTICIPATION
+  // TABLE — "BAG and TIME SLOT are separate statuses"), deliberately
+  // re-separated from the previous round, which had made BAG itself derive
+  // from the slot count:
+  //   BAG       — back to the original rule: whether the member has an
+  //               existing bag submission record at all (!!bagSubs[m.id]).
+  //   TIME SLOT — NEW column: SUBMITTED/MISSING only (never the actual
+  //               selected times — "Do NOT display the actual time slots"),
+  //               derived from bagSubmissionIsComplete()'s same 4+ selected
+  //               slots rule as before. A member can be BAG=SUBMITTED with
+  //               TIME SLOT=MISSING (submitted their bag but picked fewer
+  //               than 4 slots), or both SUBMITTED, independently.
   const rows = members
-    .map((m) => ({ m, bag: !!bagSubs[m.id], svs: !!svsSignups[m.id] }))
+    .map((m) => {
+      const sub = bagSubs[m.id];
+      return { m, bag: !!sub, timeSlot: bagSubmissionIsComplete(sub), svs: !!svsSignups[m.id] };
+    })
     .sort((a, b) => Number(a.bag && a.svs) - Number(b.bag && b.svs) || a.m.name.localeCompare(b.m.name));
   const bagRate = members.length ? Math.round((rows.filter((r) => r.bag).length / members.length) * 100) : 0;
   const svsRate = members.length ? Math.round((rows.filter((r) => r.svs).length / members.length) * 100) : 0;
@@ -5597,7 +5629,7 @@ function renderAllianceDashParticipationHtml(viewingAlliance, members, bagSubs, 
       </div>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>MEMBER</th><th>BAG</th><th>SVS SIGNUP</th></tr></thead>
+          <thead><tr><th>MEMBER</th><th>BAG</th><th>TIME SLOT</th><th>SVS SIGNUP</th></tr></thead>
           <tbody>
             ${
               rows
@@ -5606,10 +5638,11 @@ function renderAllianceDashParticipationHtml(viewingAlliance, members, bagSubs, 
               <tr>
                 <td>${escapeHtml(r.m.name)}</td>
                 <td>${r.bag ? `<span class="status-badge done">SUBMITTED</span>` : `<span class="status-badge open">MISSING</span>`}</td>
+                <td>${r.timeSlot ? `<span class="status-badge done">SUBMITTED</span>` : `<span class="status-badge open">MISSING</span>`}</td>
                 <td>${r.svs ? `<span class="status-badge done">SIGNED UP</span>` : `<span class="status-badge open">MISSING</span>`}</td>
               </tr>`
                 )
-                .join("") || `<tr><td colspan="3">No members yet.</td></tr>`
+                .join("") || `<tr><td colspan="4">No members yet.</td></tr>`
             }
           </tbody>
         </table>
